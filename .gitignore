@@ -1,0 +1,73 @@
+# EinsteinVision ignore rules
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+.env/
+*.venv
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+
+# Logs & temp files
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+# Large media artifacts
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.gif
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.bmp
+*.webp
+*.exr
+*.hdr
+
+# Archive dumps
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# Blender / 3D assets
+*.blend
+*.blend1
+*.fbx
+*.obj
+*.glb
+*.gltf
+*.usdz
+*.abc
+*.ply
+*.stl
+*.mtl
+assets/
+
+# Dataset dumps
+P3Data*/
+data/raw/
+data/output/
+
+# Generated renders
+renders/
+cache/
+
+# IDE settings
+.vscode/
+.idea/
