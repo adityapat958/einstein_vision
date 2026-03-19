@@ -1,0 +1,35 @@
+# EinsteinVision model configuration
+# Two profiles:
+#   - laptop: 8 GB VRAM, development and debugging
+#   - turing: 96 GB VRAM, high-accuracy offline runs
+
+profiles:
+  laptop:
+    detector:
+      type: yolo12          # choices: yolo12, rfdetr
+      weights: "checkpoints/yolo12_laptop.pt"
+      device: "cuda"       # or "cpu" for debugging
+      conf_threshold: 0.25
+      iou_threshold: 0.45
+      max_detections: 300
+
+    depth:
+      type: depth_anything_v2
+      weights: "checkpoints/depth_anything_v2_small.pth"
+      device: "cuda"
+      target_size: [640, 384]   # [width, height]
+
+  turing:
+    detector:
+      type: rfdetr             # choices: yolo12, rfdetr
+      weights: "checkpoints/rfdetr_large.pth"
+      device: "cuda"
+      conf_threshold: 0.3
+      iou_threshold: 0.6
+      max_detections: 500
+
+    depth:
+      type: depth_anything_v2
+      weights: "checkpoints/depth_anything_v2_base.pth"
+      device: "cuda"
+      target_size: [1024, 576]
