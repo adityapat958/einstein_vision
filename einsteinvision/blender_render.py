@@ -144,10 +144,17 @@ class LaneRenderConfig:
     collection_name: str = "EinsteinVisionLanes"
     bevel_depth: float = 0.05
     curve_resolution: int = 12
-    solid_color: tuple = (1.0, 0.95, 0.7, 1.0)
-    dashed_color: tuple = (0.9, 0.9, 0.4, 1.0)
     emission_strength: float = 0.8
     min_score: float = 0.0
+    # Per-label RGBA colors matching real-world lane markings
+    label_colors: dict = field(default_factory=lambda: {
+        "solid-line":   (1.0, 1.0, 1.0, 1.0),   # white
+        "dotted-line":  (1.0, 0.85, 0.0, 1.0),   # yellow
+        "double-line":  (1.0, 0.85, 0.0, 1.0),   # yellow (double-yellow)
+        "dashed-line":  (1.0, 1.0, 1.0, 1.0),    # white dashed
+        "divider-line": (1.0, 0.55, 0.0, 1.0),   # orange
+        "random-line":  (0.8, 0.8, 0.8, 1.0),    # light gray
+    })
 
 
 class LaneRenderer:
@@ -277,8 +284,7 @@ class LaneRenderer:
         obj = bpy.data.objects.new(name, curve_data)
         collection.objects.link(obj)
 
-        mat_key = "dashed" if any(kw in label_name for kw in ("dash", "dot")) else "solid"
-        obj.data.materials.append(self._materials[mat_key])
+        obj.data.materials.append(self._get_material(label_name))
         return obj
 
     def _apply_visibility_keyframes(self, obj: Any, blender_frame: int) -> None:
@@ -295,26 +301,33 @@ class LaneRenderer:
         set_hidden(blender_frame, False)
         set_hidden(blender_frame + 1, True)
 
+    def _make_material(self, name: str, rgba: tuple) -> Any:
+        """Creates or retrieves an emissive lane material."""
+        mat = bpy.data.materials.get(name)
+        if mat is None:
+            mat = bpy.data.materials.new(name=name)
+            mat.use_nodes = True
+            bsdf = mat.node_tree.nodes.get("Principled BSDF")
+            if bsdf:
+                bsdf.inputs["Base Color"].default_value = rgba
+                # "Emission Color" in Blender ≥4.0; "Emission" in ≤3.x
+                emit_key = "Emission Color" if "Emission Color" in bsdf.inputs else "Emission"
+                bsdf.inputs[emit_key].default_value = rgba
+                bsdf.inputs["Emission Strength"].default_value = self.config.emission_strength
+                bsdf.inputs["Roughness"].default_value = 0.3
+        return mat
+
+    def _get_material(self, label_name: str) -> Any:
+        """Returns the material for a lane label, creating it on first use."""
+        if label_name not in self._materials:
+            rgba = self.config.label_colors.get(label_name, (0.9, 0.9, 0.9, 1.0))
+            self._materials[label_name] = self._make_material(f"EV_Lane_{label_name}", rgba)
+        return self._materials[label_name]
+
     def _ensure_materials(self) -> None:
-        """Creates or retrieves emissive lane materials."""
-
-        def make_mat(name: str, rgba: tuple) -> Any:
-            mat = bpy.data.materials.get(name)
-            if mat is None:
-                mat = bpy.data.materials.new(name=name)
-                mat.use_nodes = True
-                bsdf = mat.node_tree.nodes.get("Principled BSDF")
-                if bsdf:
-                    bsdf.inputs["Base Color"].default_value = rgba
-                    # "Emission Color" in Blender ≥4.0; "Emission" in ≤3.x
-                    emit_key = "Emission Color" if "Emission Color" in bsdf.inputs else "Emission"
-                    bsdf.inputs[emit_key].default_value = rgba
-                    bsdf.inputs["Emission Strength"].default_value = self.config.emission_strength
-                    bsdf.inputs["Roughness"].default_value = 0.3
-            return mat
-
-        self._materials["solid"] = make_mat("EV_LaneSolid", self.config.solid_color)
-        self._materials["dashed"] = make_mat("EV_LaneDashed", self.config.dashed_color)
+        """Pre-create materials for all configured label types."""
+        for label, rgba in self.config.label_colors.items():
+            self._get_material(label)
 
     def _ensure_collection(self, name: str) -> Any:
         """Creates or retrieves a Blender scene collection."""
