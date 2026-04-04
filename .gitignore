@@ -1,0 +1,39 @@
+# Data — too large for git, use sync_from_cluster.sh
+cv_p3/P3Data/
+cv_p3/lane_out/
+cv_p3/lane_detection_results/
+cv_p3/blender_renders/
+phase2_output/
+
+# Model weights & checkpoints
+cv_p3/ext_models/
+cv_p3/models/
+cv_p3/RCNN_lane_detection/outputs/
+cv_p3/CLRNet/
+cv_p3/detectron2/
+cv_p3/Detic/
+cv_p3/monoloco/
+cv_p3/openpifpaf/
+cv_p3/mat_env/
+cv_p3/library/
+
+# Misc outputs
+cv_p3/output/
+cv_p3/outputs/
+cv_p3/eval/
+cv_p3/data/
+cv_p3/scene*/
+cv_p3/out.jpg
+cv_p3/*.jpg
+cv_p3/*.json
+cv_p3/*.zip
+
+# SLURM logs
+slurm-*.out
+slurm/logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
