@@ -1,18 +1,28 @@
-"""Phase 2 Blender renderer for EinsteinVision.
+"""EinsteinVision Blender World Renderer.
 
-Run from Blender, for example:
+Builds an incremental 3D world from ego-vehicle perspective using
+detection JSONs, lane JSONs, and .blend assets.
+
+Usage:
+    # World only (debug scene setup):
+    blender --python einsteinvision/blender_render.py
+
+    # World + lanes:
+    blender --python einsteinvision/blender_render.py -- \
+        --lane-json cv_p3/lane_out/scene1/lane_report_style.json
+
+    # World + detections + lanes:
+    blender --python einsteinvision/blender_render.py -- \
+        --json phase2_output/scene1/detections.json \
+        --lane-json cv_p3/lane_out/scene1/lane_report_style.json \
+        --assets-dir P3Data/Assets
+
+    # Headless render to PNG sequence:
     blender --background --python einsteinvision/blender_render.py -- \
         --json phase2_output/scene1/detections.json \
         --lane-json cv_p3/lane_out/scene1/lane_report_style.json \
-        --assets-dir cv_p3/P3Data/Assets
-
-New in Phase 2:
-  - instantiate_asset() loads real .blend assets from P3Data/Assets/
-  - Sub-class routing: "sedan" → SedanAndHatchback.blend, "suv" → SUV.blend, …
-  - Motion-state shading: parked=gray, slow=yellow-tint, moving=white
-  - Intent shading: brake lights → red emission, turn signal → blinking orange
-  - Pedestrian pose rendering: 17-point COCO skeleton as sphere+cylinder rigs
-  - Speed-limit sign texture injection
+        --assets-dir P3Data/Assets \
+        --output renders/scene1/frame_####.png
 """
 
 from __future__ import annotations
@@ -20,507 +30,264 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 try:
-    import bpy          # type: ignore
-    from mathutils import Vector, Euler  # type: ignore
-except ImportError:     # pragma: no cover – outside Blender
+    import bpy  # type: ignore
+    from mathutils import Vector  # type: ignore
+except ImportError:  # pragma: no cover
     bpy = None
     Vector = None
-    Euler = None
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ── COCO skeleton connectivity ────────────────────────────────────────────────
-COCO_SKELETON = [
-    (0, 1), (0, 2), (1, 3), (2, 4),
-    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-    (5, 11), (6, 12), (11, 12),
-    (11, 13), (13, 15), (12, 14), (14, 16),
-]
+# 1:1 metre mapping. Vehicle X->Blender X, Vehicle Z (forward)->Blender Y, Vehicle Y (up)->Blender Z.
+WORLD_STRETCH = 1.0
 
-# Default class → asset file mapping (relative to assets_dir)
-_DEFAULT_CLASS_TO_ASSET: dict[str, str] = {
+# Class name → asset .blend file (relative to --assets-dir)
+CLASS_TO_ASSET: dict[str, str] = {
+    "car":             "Vehicles/SedanAndHatchback.blend",
     "sedan":           "Vehicles/SedanAndHatchback.blend",
     "hatchback":       "Vehicles/SedanAndHatchback.blend",
     "suv":             "Vehicles/SUV.blend",
     "pickup":          "Vehicles/PickupTruck.blend",
     "truck":           "Vehicles/Truck.blend",
+    "bus":             "Vehicles/Truck.blend",
     "bicycle":         "Vehicles/Bicycle.blend",
     "motorcycle":      "Vehicles/Motorcycle.blend",
-    # Generic fallbacks
-    "car":             "Vehicles/SedanAndHatchback.blend",
-    "bus":             "Vehicles/Truck.blend",
-    "pedestrian":      "Pedestrain.blend",
     "person":          "Pedestrain.blend",
-    "traffic_light":   "TrafficSignal.blend",
+    "pedestrian":      "Pedestrain.blend",
     "traffic light":   "TrafficSignal.blend",
-    "stop_sign":       "StopSign.blend",
-    "speed_limit_sign":"SpeedLimitSign.blend",
+    "stop sign":       "StopSign.blend",
     "traffic_cone":    "TrafficConeAndCylinder.blend",
-    "traffic_cylinder":"TrafficConeAndCylinder.blend",
     "dustbin":         "Dustbin.blend",
     "trash can":       "Dustbin.blend",
 }
 
-# Realistic default scale (metres) per class  [X, Y, Z]
-_DEFAULT_SCALE: dict[str, tuple] = {
-    "sedan": (1.8, 4.5, 1.5), "hatchback": (1.7, 4.0, 1.5),
-    "suv":   (1.9, 4.7, 1.7), "pickup":    (2.0, 5.5, 1.8),
-    "truck": (2.5, 8.0, 3.5), "car":       (1.8, 4.5, 1.5),
-    "bicycle":    (0.6, 1.8, 1.0), "motorcycle": (0.8, 2.2, 1.2),
-    "pedestrian": (0.5, 0.5, 1.75), "person":    (0.5, 0.5, 1.75),
-    "traffic_light":    (0.4, 0.4, 1.2),
-    "traffic_cone":     (0.4, 0.4, 0.6),
-    "traffic_cylinder": (0.4, 0.4, 0.8),
-    "dustbin":          (0.6, 0.6, 0.9),
-    "stop_sign":        (0.6, 0.1, 0.6),
-    "speed_limit_sign": (0.6, 0.1, 0.6),
+# Uniform scale factor to normalize each asset's raw mesh to real-world metres.
+# Computed from: target_dimension / raw_mesh_dimension.
+# Scale factors to normalize each asset to real-world metres.
+# Sedan 0.18 confirmed by user. Others scaled proportionally from their raw mesh dims.
+ASSET_NORMALIZE_SCALE: dict[str, float] = {
+    "Vehicles/SedanAndHatchback.blend": 0.18,    # raw ~103m -> ~18.5m... TODO: user to verify others
+    "Vehicles/SUV.blend":              2.9,       # raw 0.66m -> 1.9m wide
+    "Vehicles/PickupTruck.blend":      0.21,      # raw 9.47m -> ~2m wide
+    "Vehicles/Truck.blend":            0.00064,   # raw 3951m -> ~2.5m wide
+    "Vehicles/Bicycle.blend":          0.16,      # raw 3.67m -> ~0.6m wide
+    "Vehicles/Motorcycle.blend":       0.0023,    # raw 351m -> ~0.8m wide
+    "Pedestrain.blend":                0.0028,    # raw 178m -> ~0.5m wide
+    "TrafficSignal.blend":             1.0,
+    "StopSign.blend":                  1.0,
+    "TrafficConeAndCylinder.blend":    1.0,
+    "Dustbin.blend":                   1.0,
+}
+
+# Fallback cube dimensions (metres) for classes without a .blend asset
+FALLBACK_SCALE: dict[str, tuple[float, float, float]] = {
+    "car":             (1.8, 4.5, 1.5),
+    "truck":           (2.5, 8.0, 3.5),
+    "bus":             (2.5, 8.0, 3.5),
+    "person":          (0.5, 0.5, 1.75),
+    "pedestrian":      (0.5, 0.5, 1.75),
+    "traffic light":   (0.4, 0.4, 1.2),
+    "stop sign":       (0.6, 0.1, 0.6),
+}
+
+# YOLO classes that are false positives in driving scenes — skip entirely
+SKIP_CLASSES: set[str] = {
+    "airplane", "boat", "train", "clock", "cell phone", "kite",
+    "bench", "parking meter", "fire hydrant", "potted plant",
 }
 
 
-@dataclass(slots=True)
-class BlenderRenderConfig:
-    """Settings for mapping fused objects to Blender assets."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# Milestone 1 — World Setup
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    assets_dir: Path
-    class_to_asset: dict[str, str] = field(default_factory=lambda: dict(_DEFAULT_CLASS_TO_ASSET))
-    collection_name: str = "EinsteinVisionActors"
+def _load_ego_vehicle(collection) -> Any | None:
+    """Load SedanAndHatchback.blend as the ego car, normalized to real-world scale."""
+    assets_dir = Path("P3Data/Assets")
+    blend_path = assets_dir / "Vehicles/SedanAndHatchback.blend"
+    if not blend_path.exists():
+        print(f"[EV] Ego asset not found: {blend_path}")
+        return None
 
-
-class BlenderSceneRenderer:
-    """Loads Phase 2 fused detections.json and keyframes all objects in Blender."""
-
-    def __init__(self, config: BlenderRenderConfig) -> None:
-        self.config = config
-        self._object_cache: dict[str, Any] = {}
-        self._material_cache: dict[str, Any] = {}
-        # Per-track position history for motion-state computation
-        self._pos_history: dict[str, deque] = {}
-        # Blinking state for turn signals
-        self._blink_state: dict[str, bool] = {}
-
-    # ── Main entry ─────────────────────────────────────────────────────────
-
-    def render_from_json(self, json_path: str | Path) -> None:
-        """Read detections.json (schema v2.0) and keyframe all objects."""
-        self._require_bpy()
-        payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
-        frames = payload.get("frames", [])
-        fps = float(payload.get("fps", 30.0))
-
-        collection = self.ensure_collection(self.config.collection_name)
-
-        for frame in frames:
-            frame_index = int(frame["frame_index"])
-            blender_frame = frame_index + 1   # Blender is 1-indexed
-
-            for obj_data in frame.get("objects", []):
-                track_id = str(obj_data["object_id"])
-                # Use sub_class if available, else class_name
-                class_name = str(
-                    obj_data.get("sub_class") or obj_data.get("class_name", "unknown")
-                ).lower()
-
-                actor = self.get_or_create_actor(track_id, class_name, collection)
-
-                pos = obj_data.get("position_xyz_m", [0, 0, 0])
-                yaw = obj_data.get("orientation_yaw_rad")
-                self.apply_keyframe(actor, blender_frame, pos, yaw)
-
-                # Motion state shading
-                motion_state = self._compute_motion_state(track_id, pos, fps)
-                declared_state = obj_data.get("motion_state", motion_state)
-                self._apply_motion_material(actor, declared_state, blender_frame)
-
-                # Intent: brake lights
-                intent = obj_data.get("intent", {})
-                if intent.get("brake_lights_on"):
-                    self._apply_brake_light(actor, blender_frame)
-
-                # Intent: turn signal blink
-                turn = intent.get("turn_signal", "none")
-                if turn in ("left", "right"):
-                    self._apply_turn_signal(actor, blender_frame, turn)
-
-        bpy.context.scene.frame_start = 1
-        bpy.context.scene.frame_end = max(
-            (int(f["frame_index"]) + 1 for f in frames), default=1
-        )
-
-    # ── Pose rendering ─────────────────────────────────────────────────────
-
-    def render_poses_from_json(self, json_path: str | Path) -> None:
-        """Render pedestrian 17-point skeletons from detections.json."""
-        self._require_bpy()
-        payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
-        frames = payload.get("frames", [])
-
-        collection = self.ensure_collection("EinsteinVisionPoses")
-        pose_objects: dict[str, list] = {}   # person_id → [sphere objects]
-
-        for frame in frames:
-            blender_frame = int(frame["frame_index"]) + 1
-            for pose in frame.get("poses", []):
-                pid = str(pose["person_track_id"])
-                kps3d = pose.get("keypoints_3d", [])
-                if not kps3d or all(k is None for k in kps3d):
-                    continue
-                self._keyframe_pose(pid, kps3d, blender_frame, collection, pose_objects)
-
-    def _keyframe_pose(
-        self,
-        person_id: str,
-        kps3d: list,
-        blender_frame: int,
-        collection,
-        pose_objects: dict,
-    ) -> None:
-        """Create sphere+cylinder skeleton for a person at a given frame."""
-        if person_id not in pose_objects:
-            # Create 17 sphere joints
-            spheres = []
-            for i in range(17):
-                bpy.ops.mesh.primitive_uv_sphere_add(radius=0.07, segments=6, ring_count=4)
-                s = bpy.context.active_object
-                s.name = f"pose_{person_id}_kp{i}"
-                s.data.materials.append(self._get_or_create_skin_material())
-                collection.objects.link(s)
-                bpy.context.scene.collection.objects.unlink(s)
-                spheres.append(s)
-
-            # Create skeleton bones (cylinders between connected kps)
-            bones = []
-            for (i, j) in COCO_SKELETON:
-                bpy.ops.mesh.primitive_cylinder_add(radius=0.025, depth=1.0)
-                b = bpy.context.active_object
-                b.name = f"pose_{person_id}_bone{i}_{j}"
-                b.data.materials.append(self._get_or_create_skin_material())
-                collection.objects.link(b)
-                bpy.context.scene.collection.objects.unlink(b)
-                bones.append((i, j, b))
-
-            pose_objects[person_id] = {"spheres": spheres, "bones": bones}
-
-        objs = pose_objects[person_id]
-        spheres = objs["spheres"]
-        bones = objs["bones"]
-
-        # Keyframe sphere positions
-        for i, kp in enumerate(kps3d[:17]):
-            s = spheres[i]
-            if kp is not None:
-                x, y, z = float(kp[0]), float(kp[2]), -float(kp[1])
-                s.location = (x, y, z)
-                s.hide_viewport = False
-                s.hide_render = False
-            else:
-                s.hide_viewport = True
-                s.hide_render = True
-            s.keyframe_insert("location", frame=blender_frame)
-            s.keyframe_insert("hide_viewport", frame=blender_frame)
-            s.keyframe_insert("hide_render", frame=blender_frame)
-
-        # Keyframe bone cylinders (position + scale + rotation between two joints)
-        for (i, j, bone) in bones:
-            kp_i = kps3d[i] if i < len(kps3d) else None
-            kp_j = kps3d[j] if j < len(kps3d) else None
-            if kp_i is None or kp_j is None:
-                bone.hide_viewport = True
-                bone.hide_render = True
-                bone.keyframe_insert("hide_viewport", frame=blender_frame)
-                bone.keyframe_insert("hide_render", frame=blender_frame)
-                continue
-            ax, ay, az = float(kp_i[0]), float(kp_i[2]), -float(kp_i[1])
-            bx, by, bz = float(kp_j[0]), float(kp_j[2]), -float(kp_j[1])
-            mid = ((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2)
-            length = math.sqrt((bx-ax)**2 + (by-ay)**2 + (bz-az)**2)
-            # Direction vector
-            dx, dy, dz = bx - ax, by - ay, bz - az
-            norm = math.sqrt(dx*dx + dy*dy + dz*dz)
-            if norm < 1e-6 or length < 0.01:
-                bone.hide_viewport = True
-                bone.hide_render = True
-                bone.keyframe_insert("hide_viewport", frame=blender_frame)
-                continue
-            bone.location = mid
-            bone.scale = (1.0, 1.0, length / 2.0)
-            # Rotation to align cylinder (default: Z-up) to bone direction
-            from mathutils import Vector as V
-            up = V((0, 0, 1))
-            direction = V((dx / norm, dy / norm, dz / norm))
-            rot = up.rotation_difference(direction)
-            bone.rotation_mode = "QUATERNION"
-            bone.rotation_quaternion = rot
-            bone.hide_viewport = False
-            bone.hide_render = False
-            bone.keyframe_insert("location", frame=blender_frame)
-            bone.keyframe_insert("scale", frame=blender_frame)
-            bone.keyframe_insert("rotation_quaternion", frame=blender_frame)
-            bone.keyframe_insert("hide_viewport", frame=blender_frame)
-            bone.keyframe_insert("hide_render", frame=blender_frame)
-
-    # ── Asset instantiation ────────────────────────────────────────────────
-
-    def ensure_collection(self, name: str):
-        self._require_bpy()
-        col = bpy.data.collections.get(name)
-        if col is None:
-            col = bpy.data.collections.new(name)
-            bpy.context.scene.collection.children.link(col)
-        return col
-
-    def get_or_create_actor(self, track_id: str, class_name: str, collection):
-        self._require_bpy()
-        if track_id in self._object_cache:
-            return self._object_cache[track_id]
-        actor = self.instantiate_asset(class_name, track_id, collection)
-        self._object_cache[track_id] = actor
-        return actor
-
-    def instantiate_asset(self, class_name: str, actor_name: str, collection):
-        """
-        Load a .blend asset for the given class and link it into the collection.
-
-        Tries bpy.ops.wm.append() from the configured assets_dir.
-        Falls back to a colour-coded primitive cube if the asset is not found.
-        """
-        self._require_bpy()
-
-        asset_rel = self.config.class_to_asset.get(class_name)
-        if asset_rel:
-            asset_path = self.config.assets_dir / asset_rel
-            if asset_path.exists():
-                try:
-                    obj = self._append_blend_object(asset_path, actor_name, collection)
-                    if obj is not None:
-                        self._set_asset_scale(obj, class_name)
-                        return obj
-                except Exception as e:
-                    print(f"[BlenderRenderer] Failed to append {asset_path}: {e}")
-
-        # Fallback: coloured cube primitive
-        return self._create_fallback_primitive(class_name, actor_name, collection)
-
-    def _append_blend_object(self, blend_path: Path, name: str, collection):
-        """Append the first mesh object from a .blend file."""
-        inner_dir = str(blend_path) + "/Object/"
-        # List available objects in the blend file
+    try:
         with bpy.data.libraries.load(str(blend_path), link=False) as (data_from, data_to):
-            obj_names = list(data_from.objects)
-            if not obj_names:
-                return None
-            data_to.objects = [obj_names[0]]
+            data_to.objects = list(data_from.objects)
 
-        obj = data_to.objects[0]
-        if obj is None:
+        meshes = [o for o in data_to.objects if o is not None and o.type not in {"CAMERA", "LIGHT"}]
+        if not meshes:
             return None
-        obj.name = name
-        collection.objects.link(obj)
-        # Unlink from any default scene collection it may have been added to
-        for col in obj.users_collection:
-            if col != collection:
-                col.objects.unlink(obj)
-        return obj
 
-    def _create_fallback_primitive(self, class_name: str, actor_name: str, collection):
-        """Create a colour-coded cube as a stand-in asset."""
-        scale = _DEFAULT_SCALE.get(class_name, (1.0, 1.0, 1.0))
+        parent = bpy.data.objects.new("EgoVehicle", None)
+        parent.empty_display_type = "ARROWS"
+        parent.empty_display_size = 0.1
+        collection.objects.link(parent)
+
+        for obj in meshes:
+            obj.name = f"EgoVehicle_{obj.name}"
+            collection.objects.link(obj)
+            for c in obj.users_collection:
+                if c != collection:
+                    c.objects.unlink(obj)
+            obj.parent = parent
+
+        # 0.018 = normalizes raw ~102m mesh to real ~1.85m sedan width
+        s = 0.018
+        parent.scale = (s, s, s)
+        parent.rotation_euler = (0.0, 0.0, math.radians(90))
+        # Place ego behind the detection origin so it doesn't overlap detected cars
+        parent.location = (0.0, -3.0, 0.0)
+        return parent
+
+    except Exception as e:
+        print(f"[EV] Failed to load ego vehicle: {e}")
+        return None
+
+
+def _setup_world() -> None:
+    """Clear default scene and build: ground, sky, lighting, camera, ego car."""
+    if bpy is None:
+        return
+
+    scene = bpy.context.scene
+
+    # ── Clear defaults ────────────────────────────────────────────────────
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.delete()
+
+    # ── Render engine ─────────────────────────────────────────────────────
+    scene.render.engine = "BLENDER_EEVEE_NEXT"
+    scene.render.resolution_x = 1920
+    scene.render.resolution_y = 1080
+    scene.render.image_settings.file_format = "PNG"
+
+    # ── World collection ──────────────────────────────────────────────────
+    col = bpy.data.collections.get("EinsteinVisionWorld")
+    if col is None:
+        col = bpy.data.collections.new("EinsteinVisionWorld")
+        scene.collection.children.link(col)
+
+    # ── Ground plane ──────────────────────────────────────────────────────
+    bpy.ops.mesh.primitive_plane_add(size=1000.0, location=(0.0, 0.0, 0.0))
+    ground = bpy.context.active_object
+    ground.name = "Ground"
+
+    mat = bpy.data.materials.new("GroundMat")
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    if bsdf:
+        bsdf.inputs["Base Color"].default_value = (0.08, 0.08, 0.08, 1.0)
+        bsdf.inputs["Roughness"].default_value = 0.85
+        if "Specular IOR Level" in bsdf.inputs:
+            bsdf.inputs["Specular IOR Level"].default_value = 0.1
+    ground.data.materials.append(mat)
+
+    col.objects.link(ground)
+    for c in ground.users_collection:
+        if c != col:
+            c.objects.unlink(ground)
+
+    # ── Sky / world background ────────────────────────────────────────────
+    world = scene.world
+    if world is None:
+        world = bpy.data.worlds.new("World")
+        scene.world = world
+    world.use_nodes = True
+    bg = world.node_tree.nodes.get("Background")
+    if bg:
+        bg.inputs["Color"].default_value = (0.45, 0.58, 0.72, 1.0)
+        bg.inputs["Strength"].default_value = 0.8
+
+    # ── Sun light ─────────────────────────────────────────────────────────
+    sun_data = bpy.data.lights.new("Sun", type="SUN")
+    sun_data.energy = 3.0
+    sun_data.angle = math.radians(5.0)
+    sun_obj = bpy.data.objects.new("Sun", sun_data)
+    col.objects.link(sun_obj)
+    sun_obj.rotation_euler = (math.radians(45), math.radians(30), 0.0)
+
+    # ── Fill light ────────────────────────────────────────────────────────
+    fill_data = bpy.data.lights.new("Fill", type="SUN")
+    fill_data.energy = 0.8
+    fill_data.angle = math.radians(15.0)
+    fill_obj = bpy.data.objects.new("Fill", fill_data)
+    col.objects.link(fill_obj)
+    fill_obj.rotation_euler = (math.radians(120), 0.0, math.radians(-45))
+
+    # ── Chase camera ──────────────────────────────────────────────────────
+    cam_data = bpy.data.cameras.new("ChaseCam")
+    cam_data.lens = 35
+    cam_data.clip_end = 2000.0
+    cam_obj = bpy.data.objects.new("ChaseCam", cam_data)
+    col.objects.link(cam_obj)
+    # Further back, higher up, looking forward+down at the ego car
+    # Camera transform from user (converted degrees to radians)
+    cam_obj.location = (-37.6, 1.46, 11.88)
+    cam_obj.rotation_euler = (math.radians(77), math.radians(0), math.radians(-92))
+    scene.camera = cam_obj
+
+    # ── Ego vehicle — load real SedanAndHatchback asset ───────────────────
+    ego = _load_ego_vehicle(col)
+    if ego is None:
+        # Fallback cube if asset missing
         bpy.ops.mesh.primitive_cube_add(size=1.0)
-        obj = bpy.context.active_object
-        obj.name = actor_name
-        obj.scale = scale
-        # Apply a distinctive colour per class category
-        mat = self._get_or_create_class_material(class_name)
-        obj.data.materials.append(mat)
-        collection.objects.link(obj)
-        for c in obj.users_collection:
-            if c != collection:
-                c.objects.unlink(obj)
-        return obj
-
-    def _set_asset_scale(self, obj, class_name: str) -> None:
-        scale = _DEFAULT_SCALE.get(class_name)
-        if scale:
-            obj.scale = scale
-
-    # ── Material helpers ────────────────────────────────────────────────────
-
-    def _get_or_create_class_material(self, class_name: str):
-        key = f"EV_class_{class_name}"
-        if key in self._material_cache:
-            return self._material_cache[key]
-        # Colour palette per class
-        colours = {
-            "sedan": (0.2, 0.4, 0.9, 1), "hatchback": (0.2, 0.4, 0.9, 1),
-            "suv":   (0.1, 0.3, 0.8, 1), "pickup":    (0.3, 0.5, 0.9, 1),
-            "truck": (0.5, 0.3, 0.1, 1), "car":       (0.2, 0.4, 0.9, 1),
-            "bicycle":    (0.0, 0.7, 0.3, 1), "motorcycle": (0.0, 0.6, 0.3, 1),
-            "pedestrian": (0.9, 0.6, 0.1, 1), "person":    (0.9, 0.6, 0.1, 1),
-            "traffic_light": (0.1, 0.8, 0.1, 1),
-            "traffic_cone":  (0.9, 0.4, 0.0, 1),
-            "dustbin":       (0.4, 0.4, 0.4, 1),
-        }
-        rgba = colours.get(class_name, (0.6, 0.6, 0.6, 1))
-        mat = self._make_principled_material(key, rgba)
-        self._material_cache[key] = mat
-        return mat
-
-    def _get_or_create_skin_material(self):
-        key = "EV_pose_skin"
-        if key not in self._material_cache:
-            self._material_cache[key] = self._make_principled_material(
-                key, (0.9, 0.75, 0.6, 1)
-            )
-        return self._material_cache[key]
-
-    def _make_principled_material(self, name: str, rgba: tuple, emission: float = 0.0):
-        mat = bpy.data.materials.get(name)
-        if mat is None:
-            mat = bpy.data.materials.new(name)
-            mat.use_nodes = True
-            bsdf = mat.node_tree.nodes.get("Principled BSDF")
-            if bsdf:
-                bsdf.inputs["Base Color"].default_value = rgba
-                bsdf.inputs["Roughness"].default_value = 0.5
-                if emission > 0:
-                    emit_key = (
-                        "Emission Color"
-                        if "Emission Color" in bsdf.inputs
-                        else "Emission"
-                    )
-                    bsdf.inputs[emit_key].default_value = rgba
-                    bsdf.inputs["Emission Strength"].default_value = emission
-        return mat
-
-    # ── Motion-state shading ───────────────────────────────────────────────
-
-    def _compute_motion_state(self, track_id: str, pos: list, fps: float) -> str:
-        if track_id not in self._pos_history:
-            self._pos_history[track_id] = deque(maxlen=5)
-        hist = self._pos_history[track_id]
-        hist.append(pos[:])
-        if len(hist) < 2:
-            return "unknown"
-        prev = hist[-2]
-        dx = pos[0] - prev[0]
-        dz = pos[2] - prev[2]
-        speed = math.sqrt(dx * dx + dz * dz) * fps
-        if speed < 0.3:
-            return "parked"
-        if speed < 2.0:
-            return "slow"
-        return "moving"
-
-    def _apply_motion_material(self, obj, state: str, frame: int) -> None:
-        colour_map = {
-            "parked":  (0.5, 0.5, 0.5, 1),
-            "slow":    (0.9, 0.8, 0.1, 1),
-            "moving":  (0.9, 0.9, 0.9, 1),
-            "unknown": (0.6, 0.6, 0.6, 1),
-        }
-        rgba = colour_map.get(state, (0.6, 0.6, 0.6, 1))
-        key = f"EV_motion_{state}"
-        if key not in self._material_cache:
-            self._material_cache[key] = self._make_principled_material(key, rgba)
-        mat = self._material_cache[key]
-        if obj.data and hasattr(obj.data, "materials"):
-            if len(obj.data.materials) == 0:
-                obj.data.materials.append(mat)
-            else:
-                obj.data.materials[0] = mat
-
-    # ── Intent shading ─────────────────────────────────────────────────────
-
-    def _apply_brake_light(self, obj, frame: int) -> None:
-        """Add red emissive material on brake-light frames."""
-        key = "EV_brake_light"
-        if key not in self._material_cache:
-            self._material_cache[key] = self._make_principled_material(
-                key, (1.0, 0.05, 0.05, 1), emission=2.0
-            )
-        mat = self._material_cache[key]
-        if obj.data and hasattr(obj.data, "materials"):
-            # Append brake-light material slot if not present
-            if mat.name not in [m.name for m in obj.data.materials if m]:
-                obj.data.materials.append(mat)
-
-    def _apply_turn_signal(self, obj, frame: int, side: str) -> None:
-        """Blink orange emission at ~1.5 Hz."""
-        key = f"EV_turn_{side}"
-        if key not in self._material_cache:
-            self._material_cache[key] = self._make_principled_material(
-                key, (1.0, 0.5, 0.0, 1), emission=1.5
-            )
-        mat = self._material_cache[key]
-        # Toggle every 10 frames (≈1.5 Hz at 30 fps)
-        is_on = (frame // 10) % 2 == 0
-        if obj.data and hasattr(obj.data, "materials") and is_on:
-            if mat.name not in [m.name for m in obj.data.materials if m]:
-                obj.data.materials.append(mat)
-
-    # ── Keyframing ─────────────────────────────────────────────────────────
-
-    def apply_keyframe(
-        self,
-        blender_object,
-        frame_index: int,
-        position_xyz: list,
-        yaw_rad: float | None,
-    ) -> None:
-        self._require_bpy()
-        blender_object.location = (
-            float(position_xyz[0]),
-            float(position_xyz[2]),   # Z forward → Blender Y
-            -float(position_xyz[1]),  # Y up → Blender -Z (camera Y-down)
-        )
-        if yaw_rad is not None:
-            blender_object.rotation_mode = "XYZ"
-            blender_object.rotation_euler[2] = float(yaw_rad)
-        blender_object.keyframe_insert(data_path="location", frame=frame_index)
-        blender_object.keyframe_insert(data_path="rotation_euler", frame=frame_index)
-
-    @staticmethod
-    def _require_bpy() -> None:
-        if bpy is None:
-            raise RuntimeError(
-                "This module must be executed inside Blender where 'bpy' is available."
-            )
+        ego = bpy.context.active_object
+        ego.name = "EgoVehicle"
+        ego.scale = (1.8, 4.5, 1.5)
+        ego.location = (0.0, 2.25, 0.75)
+        ego_mat = bpy.data.materials.new("EgoMat")
+        ego_mat.use_nodes = True
+        bsdf = ego_mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf:
+            bsdf.inputs["Base Color"].default_value = (0.05, 0.05, 0.05, 1.0)
+            bsdf.inputs["Roughness"].default_value = 0.3
+        ego.data.materials.append(ego_mat)
+        col.objects.link(ego)
+        for c in ego.users_collection:
+            if c != col:
+                c.objects.unlink(ego)
 
 
-# ── Lane renderer (unchanged from Phase 1, kept here for single-file import) ──
+# ═══════════════════════════════════════════════════════════════════════════════
+# Milestone 2 — Lane Renderer
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass(slots=True)
 class LaneRenderConfig:
     collection_name: str = "EinsteinVisionLanes"
-    bevel_depth: float = 0.05
+    bevel_depth: float = 0.025  # metres, will be multiplied by WORLD_STRETCH in Blender units
     curve_resolution: int = 12
+    solid_color: tuple = (1.0, 0.95, 0.7, 1.0)
+    dashed_color: tuple = (0.9, 0.9, 0.4, 1.0)
     emission_strength: float = 0.8
     min_score: float = 0.0
-    label_colors: dict = field(default_factory=lambda: {
-        "solid-line":   (1.0, 1.0, 1.0, 1.0),
-        "dotted-line":  (1.0, 0.85, 0.0, 1.0),
-        "double-line":  (1.0, 0.85, 0.0, 1.0),
-        "dashed-line":  (1.0, 1.0, 1.0, 1.0),
-        "divider-line": (1.0, 0.55, 0.0, 1.0),
-        "random-line":  (0.8, 0.8, 0.8, 1.0),
-    })
 
 
 class LaneRenderer:
-    """Reads lane_report_style.json and builds animated NURBS lane splines."""
+    """Renders lane detections as animated NURBS curves, one per (frame, lane).
+
+    Coordinate mapping (vehicle -> Blender, with WORLD_STRETCH):
+        vehicle X (right)   * WORLD_STRETCH -> Blender X
+        vehicle Z (forward) * WORLD_STRETCH -> Blender Y
+        vehicle Y (height)  * WORLD_STRETCH -> Blender Z
+    """
 
     def __init__(self, config: LaneRenderConfig | None = None) -> None:
         self.config = config or LaneRenderConfig()
         self._materials: dict[str, Any] = {}
 
     def render_lanes_from_json(self, json_path: str | Path) -> None:
-        self._require_bpy()
+        if bpy is None:
+            return
         payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
         frames = payload.get("frames", [])
+
         collection = self._ensure_collection(self.config.collection_name)
         self._ensure_materials()
 
@@ -531,17 +298,15 @@ class LaneRenderer:
             for lane_i, lane in enumerate(frame.get("lanes", [])):
                 if float(lane.get("score", 1.0)) < self.config.min_score:
                     continue
+
                 pts_gv = lane.get("points_ground_vehicle")
                 if not pts_gv:
                     pts_cam = lane.get("points_3d_camera")
                     if pts_cam:
                         pts_gv = [[p[0], -p[1], p[2]] for p in pts_cam if p is not None]
-                if not pts_gv:
-                    pts_2d = lane.get("points_2d")
-                    if pts_2d:
-                        pts_gv = self._project_2d_to_ground(pts_2d)
                 if not pts_gv or len(pts_gv) < 2:
                     continue
+
                 world_pts = [self._vehicle_to_blender(p) for p in pts_gv]
                 label = str(lane.get("label_name", "")).lower()
                 obj = self._make_lane_curve(
@@ -553,126 +318,334 @@ class LaneRenderer:
                 self._apply_visibility_keyframes(obj, blender_frame=frame_idx + 1)
 
         bpy.context.scene.frame_start = 1
-        bpy.context.scene.frame_end = max_frame
+        bpy.context.scene.frame_end = max(bpy.context.scene.frame_end, max_frame)
 
     @staticmethod
-    def _vehicle_to_blender(p: list):
-        return Vector((float(p[0]), float(p[2]), float(p[1])))
+    def _vehicle_to_blender(p: list[float]):
+        """Vehicle (X right, Y up, Z forward) -> Blender (X right, Y forward, Z up)."""
+        return Vector((
+            float(p[0]),   # lateral X -> Blender X
+            float(p[2]),   # forward Z -> Blender Y
+            float(p[1]),   # height Y -> Blender Z
+        ))
 
-    @staticmethod
-    def _project_2d_to_ground(
-        pts_2d,
-        fx=1594.7, fy=1607.7, cx=654.3, cy=413.4,
-        cam_height=1.45, cam_pitch_deg=5.0,
-    ):
-        pitch = math.radians(cam_pitch_deg)
-        cp, sp = math.cos(pitch), math.sin(pitch)
-        results = []
-        for u, v in pts_2d:
-            rx = (u - cx) / fx
-            ry_veh = -((v - cy) / fy)
-            ry_rot = cp * ry_veh - sp * 1.0
-            rz_rot = sp * ry_veh + cp * 1.0
-            if abs(ry_rot) < 1e-8:
-                continue
-            t = -cam_height / ry_rot
-            if t <= 0:
-                continue
-            results.append([rx * t, cam_height + t * ry_rot, rz_rot * t])
-        return results
-
-    def _make_lane_curve(self, name, world_pts, label_name, collection):
+    def _make_lane_curve(self, name: str, world_pts: list, label_name: str, collection) -> Any:
         curve_data = bpy.data.curves.new(name=f"{name}_data", type="CURVE")
         curve_data.dimensions = "3D"
         curve_data.resolution_u = self.config.curve_resolution
-        curve_data.bevel_depth = self.config.bevel_depth
+        curve_data.bevel_depth = self.config.bevel_depth  # in metres, 1:1 with world
         curve_data.bevel_resolution = 4
         curve_data.fill_mode = "FULL"
+
         spline = curve_data.splines.new("NURBS")
         spline.points.add(len(world_pts) - 1)
         for i, v in enumerate(world_pts):
             spline.points[i].co = (v.x, v.y, v.z, 1.0)
         spline.use_endpoint_u = True
+
         obj = bpy.data.objects.new(name, curve_data)
         collection.objects.link(obj)
-        obj.data.materials.append(self._get_material(label_name))
+
+        mat_key = "dashed" if any(kw in label_name for kw in ("dash", "dot")) else "solid"
+        obj.data.materials.append(self._materials[mat_key])
         return obj
 
-    def _apply_visibility_keyframes(self, obj, blender_frame):
-        def set_hidden(frame, hidden):
+    def _apply_visibility_keyframes(self, obj: Any, blender_frame: int) -> None:
+        def set_hidden(frame: int, hidden: bool) -> None:
             obj.hide_viewport = hidden
             obj.hide_render = hidden
             obj.keyframe_insert(data_path="hide_viewport", frame=frame)
             obj.keyframe_insert(data_path="hide_render", frame=frame)
+
         if blender_frame > 1:
             set_hidden(blender_frame - 1, True)
         set_hidden(blender_frame, False)
         set_hidden(blender_frame + 1, True)
 
-    def _make_material(self, name, rgba):
-        mat = bpy.data.materials.get(name)
-        if mat is None:
-            mat = bpy.data.materials.new(name=name)
-            mat.use_nodes = True
-            bsdf = mat.node_tree.nodes.get("Principled BSDF")
-            if bsdf:
-                bsdf.inputs["Base Color"].default_value = rgba
-                emit_key = "Emission Color" if "Emission Color" in bsdf.inputs else "Emission"
-                bsdf.inputs[emit_key].default_value = rgba
-                bsdf.inputs["Emission Strength"].default_value = self.config.emission_strength
-                bsdf.inputs["Roughness"].default_value = 0.3
-        return mat
+    def _ensure_materials(self) -> None:
+        def make_mat(name: str, rgba: tuple) -> Any:
+            mat = bpy.data.materials.get(name)
+            if mat is None:
+                mat = bpy.data.materials.new(name=name)
+                mat.use_nodes = True
+                bsdf = mat.node_tree.nodes.get("Principled BSDF")
+                if bsdf:
+                    bsdf.inputs["Base Color"].default_value = rgba
+                    emit_key = "Emission Color" if "Emission Color" in bsdf.inputs else "Emission"
+                    bsdf.inputs[emit_key].default_value = rgba
+                    bsdf.inputs["Emission Strength"].default_value = self.config.emission_strength
+                    bsdf.inputs["Roughness"].default_value = 0.3
+            return mat
 
-    def _get_material(self, label_name):
-        if label_name not in self._materials:
-            rgba = self.config.label_colors.get(label_name, (0.9, 0.9, 0.9, 1.0))
-            self._materials[label_name] = self._make_material(f"EV_Lane_{label_name}", rgba)
-        return self._materials[label_name]
+        self._materials["solid"] = make_mat("EV_LaneSolid", self.config.solid_color)
+        self._materials["dashed"] = make_mat("EV_LaneDashed", self.config.dashed_color)
 
-    def _ensure_materials(self):
-        for label, rgba in self.config.label_colors.items():
-            self._get_material(label)
+    def _ensure_collection(self, name: str) -> Any:
+        collection = bpy.data.collections.get(name)
+        if collection is None:
+            collection = bpy.data.collections.new(name)
+            bpy.context.scene.collection.children.link(collection)
+        return collection
 
-    def _ensure_collection(self, name):
-        col = bpy.data.collections.get(name)
-        if col is None:
-            col = bpy.data.collections.new(name)
-            bpy.context.scene.collection.children.link(col)
-        return col
 
-    @staticmethod
-    def _require_bpy():
+# ═══════════════════════════════════════════════════════════════════════════════
+# Milestone 3 — Object Detection Renderer
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(slots=True)
+class BlenderRenderConfig:
+    assets_dir: Path = field(default_factory=lambda: Path("P3Data/Assets"))
+    collection_name: str = "EinsteinVisionActors"
+
+
+class BlenderSceneRenderer:
+    """Loads fused detection JSON and keyframes tracked objects in Blender.
+
+    Features:
+        - Lazy asset loading (objects created on first appearance)
+        - Track healing (merges broken YOLO IDs by proximity)
+        - Scale-based visibility (0,0,0 when hidden, real scale when visible)
+        - CONSTANT interpolation for instant pop in/out
+    """
+
+    def __init__(self, config: BlenderRenderConfig) -> None:
+        self.config = config
+        self._object_cache: dict[str, Any] = {}
+
+    def render_from_json(self, json_path: str | Path) -> None:
         if bpy is None:
-            raise RuntimeError("Must run inside Blender.")
+            return
+        payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        frames = payload.get("frames", [])
+
+        collection = self._ensure_collection(self.config.collection_name)
+
+        # Track healer state: {track_id: (position, class_name)}
+        active_tracks: dict[str, tuple[list, str]] = {}
+
+        for frame in frames:
+            frame_index = int(frame["frame_index"])
+            current_tracks: dict[str, tuple[list, str]] = {}
+
+            for obj_data in frame.get("objects", []):
+                class_name = str(obj_data.get("class_name", "unknown")).lower()
+
+                # Skip bogus YOLO detections
+                if class_name in SKIP_CLASSES:
+                    continue
+
+                # Use sub_class for finer asset selection (sedan, suv, pickup, etc.)
+                sub_class = obj_data.get("sub_class")
+                lookup_class = str(sub_class).lower() if sub_class else class_name
+
+                raw_id = str(obj_data["object_id"])
+                pos = obj_data["position_xyz_m"]
+
+                # ── Track healing ─────────────────────────────────────────
+                matched_id = raw_id
+                best_dist = 2.5  # max metres a car can jump in one frame
+                for active_id, (active_pos, active_class) in active_tracks.items():
+                    if active_class == class_name:
+                        dist = math.dist(
+                            [pos[0], pos[2]],
+                            [active_pos[0], active_pos[2]],
+                        )
+                        if dist < best_dist:
+                            best_dist = dist
+                            matched_id = active_id
+
+                current_tracks[matched_id] = (pos, class_name)
+
+                # Use lookup_class (sub_class if available) for asset selection
+                actor = self._get_or_create_actor(matched_id, lookup_class, collection)
+                self._apply_keyframe(
+                    actor, frame_index,
+                    pos, obj_data.get("orientation_yaw_rad"),
+                )
+
+            active_tracks = current_tracks
+
+        # Set timeline range
+        if frames:
+            max_frame = max(int(f["frame_index"]) for f in frames) + 1
+            bpy.context.scene.frame_end = max(bpy.context.scene.frame_end, max_frame)
+
+    # ── Actor management ──────────────────────────────────────────────────
+
+    def _get_or_create_actor(self, track_id: str, class_name: str, collection) -> Any:
+        if track_id in self._object_cache:
+            return self._object_cache[track_id]
+
+        actor = self._instantiate_asset(class_name, track_id, collection)
+
+        # Start hidden on frame 1
+        actor.scale = (0.0, 0.0, 0.0)
+        actor.keyframe_insert(data_path="scale", frame=1)
+
+        self._object_cache[track_id] = actor
+        return actor
+
+    def _instantiate_asset(self, class_name: str, actor_name: str, collection) -> Any:
+        asset_rel = CLASS_TO_ASSET.get(class_name)
+        asset_path = self.config.assets_dir / asset_rel if asset_rel else None
+
+        # Try loading real .blend asset
+        if asset_path and asset_path.exists():
+            try:
+                return self._load_blend_asset(asset_path, asset_rel, actor_name, collection)
+            except Exception as e:
+                print(f"[EV] Failed to load {asset_path}: {e}")
+
+        # Fallback: coloured cube
+        return self._create_fallback_cube(class_name, actor_name, collection)
+
+    def _load_blend_asset(self, blend_path: Path, asset_rel: str, name: str, collection) -> Any:
+        """Load all mesh/curve objects from a .blend, parent to an empty."""
+        with bpy.data.libraries.load(str(blend_path), link=False) as (data_from, data_to):
+            data_to.objects = list(data_from.objects)
+
+        meshes = [o for o in data_to.objects if o is not None and o.type not in {"CAMERA", "LIGHT"}]
+        if not meshes:
+            raise ValueError(f"No mesh objects in {blend_path}")
+
+        parent = bpy.data.objects.new(name, None)
+        parent.empty_display_type = "ARROWS"
+        parent.empty_display_size = 0.5
+        collection.objects.link(parent)
+
+        for obj in meshes:
+            obj.name = f"{name}_{obj.name}"
+            collection.objects.link(obj)
+            for c in obj.users_collection:
+                if c != collection:
+                    c.objects.unlink(obj)
+            obj.parent = parent
+
+        # Normalize scale
+        normalize = ASSET_NORMALIZE_SCALE.get(asset_rel, 1.0)
+        parent["visible_scale"] = (normalize, normalize, normalize)
+
+        # Signs and lights face wrong direction — rotate 180° on Z
+        ROTATE_180 = {"TrafficSignal.blend", "StopSign.blend"}
+        if asset_rel in ROTATE_180:
+            parent.rotation_euler = (0.0, 0.0, math.radians(180))
+
+        return parent
+
+    def _create_fallback_cube(self, class_name: str, actor_name: str, collection) -> Any:
+        bpy.ops.mesh.primitive_cube_add(size=1.0)
+        actor = bpy.context.active_object
+        actor.name = actor_name
+
+        dims = FALLBACK_SCALE.get(class_name, (1.0, 1.0, 1.0))
+        actor["visible_scale"] = (dims[0], dims[1], dims[2])
+
+        # Give it a distinct colour
+        mat = bpy.data.materials.new(f"mat_{class_name}")
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf:
+            # Colour by class
+            colors = {
+                "car": (0.2, 0.4, 0.8, 1.0),
+                "truck": (0.8, 0.3, 0.1, 1.0),
+                "bus": (0.8, 0.5, 0.0, 1.0),
+                "person": (0.1, 0.8, 0.3, 1.0),
+                "pedestrian": (0.1, 0.8, 0.3, 1.0),
+            }
+            bsdf.inputs["Base Color"].default_value = colors.get(class_name, (0.5, 0.5, 0.5, 1.0))
+        actor.data.materials.append(mat)
+
+        collection.objects.link(actor)
+        for c in actor.users_collection:
+            if c != collection:
+                c.objects.unlink(actor)
+
+        return actor
+
+    # ── Keyframing ────────────────────────────────────────────────────────
+
+    def _apply_keyframe(
+        self,
+        blender_object: Any,
+        frame_index: int,
+        position_xyz: list[float],
+        yaw_rad: float | None,
+    ) -> None:
+        # Vehicle (X right, Y up, Z forward) -> Blender (X right, Y forward, Z up)
+        blender_object.location = (
+            float(position_xyz[0]),   # lateral X -> X
+            float(position_xyz[2]),   # forward Z -> Blender Y
+            float(position_xyz[1]),   # height Y -> Blender Z
+        )
+        if yaw_rad is not None:
+            blender_object.rotation_mode = "XYZ"
+            blender_object.rotation_euler[2] = float(yaw_rad)
+
+        blender_object.keyframe_insert(data_path="location", frame=frame_index)
+        blender_object.keyframe_insert(data_path="rotation_euler", frame=frame_index)
+
+        # Pop visible on this frame
+        target_scale = blender_object.get("visible_scale", (1.0, 1.0, 1.0))
+        blender_object.scale = target_scale
+        blender_object.keyframe_insert(data_path="scale", frame=frame_index)
+
+        # Pre-emptively vanish next frame (overridden if object persists)
+        blender_object.scale = (0.0, 0.0, 0.0)
+        blender_object.keyframe_insert(data_path="scale", frame=frame_index + 1)
+
+        # Force instant transitions (no easing between visible/hidden)
+        if blender_object.animation_data and blender_object.animation_data.action:
+            for fc in blender_object.animation_data.action.fcurves:
+                if fc.data_path == "scale":
+                    for kf in fc.keyframe_points:
+                        kf.interpolation = "CONSTANT"
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _ensure_collection(self, name: str) -> Any:
+        collection = bpy.data.collections.get(name)
+        if collection is None:
+            collection = bpy.data.collections.new(name)
+            bpy.context.scene.collection.children.link(collection)
+        return collection
 
 
-# ── CLI entry point ───────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_cli_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="EinsteinVision Phase 2 Blender renderer")
-    p.add_argument("--json",       dest="json_path",      default=None, help="Phase 2 detections.json")
-    p.add_argument("--lane-json",  dest="lane_json_path", default=None, help="lane_report_style.json")
-    p.add_argument("--assets-dir", dest="assets_dir",
-                   default=str(Path(__file__).parent.parent / "cv_p3" / "P3Data" / "Assets"),
-                   help="Root directory of .blend asset files")
-    p.add_argument("--lane-bevel-depth", type=float, default=0.05)
-    p.add_argument("--lane-min-score",   type=float, default=0.1)
-    p.add_argument("--output", default=None, help="Render output pattern (e.g. /tmp/frame_####.png)")
+    p = argparse.ArgumentParser(description="EinsteinVision Blender World Renderer")
+    p.add_argument("--json", dest="json_path", default=None,
+                   help="Path to detections JSON (phase2_output/sceneN/detections.json)")
+    p.add_argument("--lane-json", dest="lane_json_path", default=None,
+                   help="Path to lane_report_style.json")
+    p.add_argument("--assets-dir", dest="assets_dir", default="P3Data/Assets",
+                   help="Directory containing .blend asset files")
+    p.add_argument("--lane-bevel-depth", type=float, default=0.05,
+                   help="Lane tube radius in metres (before stretch)")
+    p.add_argument("--lane-min-score", type=float, default=0.0,
+                   help="Minimum lane confidence to render")
+    p.add_argument("--output", default=None,
+                   help="Render output path/pattern (e.g. renders/frame_####.png)")
     return p
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> None:
     parser = _build_cli_parser()
     args = parser.parse_args(argv)
 
+    # Always set up the world
+    _setup_world()
+
+    # M3: Detected objects
     if args.json_path:
-        config = BlenderRenderConfig(
-            assets_dir=Path(args.assets_dir),
-        )
+        config = BlenderRenderConfig(assets_dir=Path(args.assets_dir))
         renderer = BlenderSceneRenderer(config=config)
         renderer.render_from_json(args.json_path)
-        renderer.render_poses_from_json(args.json_path)
 
+    # M2: Lanes
     if args.lane_json_path:
         lane_config = LaneRenderConfig(
             bevel_depth=args.lane_bevel_depth,
@@ -680,11 +653,13 @@ def main(argv=None):
         )
         LaneRenderer(config=lane_config).render_lanes_from_json(args.lane_json_path)
 
+    # Headless render (only with --output)
     if args.output and bpy is not None:
         bpy.context.scene.render.filepath = args.output
-        bpy.context.scene.render.image_settings.file_format = "PNG"
         bpy.ops.render.render(animation=True)
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    main(argv)

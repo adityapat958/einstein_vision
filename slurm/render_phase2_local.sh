@@ -27,7 +27,7 @@ else
 fi
 BLENDER="${BLENDER_OVERRIDE:-$BLENDER_DEFAULT}"
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$REPO/einsteinvision/blender_render.py"
 ASSETS="$REPO/cv_p3/P3Data/Assets"
 LANE_OUT="$REPO/cv_p3/lane_out"
@@ -69,26 +69,24 @@ for SCENE_NUM in "${SCENES[@]}"; do
 
     mkdir -p "$FRAME_DIR"
 
-    # Build Blender args
-    BLENDER_ARGS=(
-        --background
-        --python "$SCRIPT" --
+    # Build Python script args (after the -- separator)
+    SCRIPT_ARGS=(
         --assets-dir "$ASSETS"
         --lane-bevel-depth "$LANE_BEVEL"
         --lane-min-score "$LANE_MIN_SCORE"
         --output "$FRAME_DIR/frame_####.png"
     )
     if [[ -f "$LANE_JSON" ]]; then
-        BLENDER_ARGS+=(--lane-json "$LANE_JSON")
+        SCRIPT_ARGS+=(--lane-json "$LANE_JSON")
     else
         echo "  [INFO] No lane JSON found — rendering objects only"
     fi
     if [[ -f "$DET_JSON" ]]; then
-        BLENDER_ARGS+=(--json "$DET_JSON")
+        SCRIPT_ARGS+=(--json "$DET_JSON")
     fi
 
     echo "  Running Blender..."
-    "$BLENDER" "${BLENDER_ARGS[@]}"
+    "$BLENDER" --background --python "$SCRIPT" -- "${SCRIPT_ARGS[@]}"
 
     # Count frames rendered
     N_FRAMES=$(ls "$FRAME_DIR"/frame_*.png 2>/dev/null | wc -l | tr -d ' ')
