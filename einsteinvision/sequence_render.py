@@ -38,13 +38,16 @@ def gauss_smooth(series: dict[int, dict], sigma: float, keys=("x", "y")):
     if len(fr) < 6:
         return {}
     out = {}
-    W = int(3 * sigma)
     lo, hi = fr[0], fr[-1]
+    ymed = sorted(series[f]["y"] for f in fr)[len(fr) // 2]
+    sg = sigma * min(max(ymed / 30.0, 1.0), 2.6)      # depth noise ∝ z² → wider window far away
+    W = int(3 * sg)
     for k in range(lo, hi + 1):
-        near = [f for f in fr if abs(f - k) <= W]
-        if not near or min(abs(f - k) for f in near) > 4:     # gap too long → hidden
+        near0 = [f for f in fr if abs(f - k) <= 6]
+        if not near0 or min(abs(f - k) for f in near0) > 4:   # gap too long → hidden
             continue
-        ws = [math.exp(-0.5 * ((f - k) / sigma) ** 2) for f in near]
+        near = [f for f in fr if abs(f - k) <= W]
+        ws = [math.exp(-0.5 * ((f - k) / sg) ** 2) for f in near]
         sw = sum(ws)
         base = series[min(near, key=lambda f: abs(f - k))]
         o = dict(base)
@@ -84,6 +87,7 @@ def main(argv):
     ap.add_argument("--res", type=int, nargs=2, default=(1280, 720))
     ap.add_argument("--sigma", type=float, default=3.5)
     ap.add_argument("--raw", action="store_true", help="no smoothing (for comparison)")
+    ap.add_argument("--analyze", action="store_true", help="print jitter by distance, no render")
     a = ap.parse_args(argv)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -115,6 +119,13 @@ def main(argv):
     else:
         sm_tracks = {o: gauss_smooth(s, a.sigma) for o, s in raw_tracks.items()}
     jr, js = jitter_cm(raw_tracks), jitter_cm(sm_tracks)
+    if a.analyze:
+        for lo, hi in ((0, 20), (20, 40), (40, 70), (70, 120)):
+            band = lambda T: {o: {k: p for k, p in s_.items() if lo <= p["y"] < hi} for o, s_ in T.items()}
+            n = sum(len(v) for v in band(raw_tracks).values())
+            print(f"[seq] y {lo:3d}-{hi:3d} m: n={n:4d}  raw {jitter_cm(band(raw_tracks)):6.1f}  "
+                  f"smooth {jitter_cm(band(sm_tracks)):6.1f} cm/frame")
+        return
     print(f"[seq] object jitter (RMS 2nd diff): raw {jr:.1f} cm/frame → smoothed {js:.1f} cm/frame")
     per_frame = defaultdict(list)
     for o, s in sm_tracks.items():
@@ -125,7 +136,7 @@ def main(argv):
     road_s = {}
     changes_raw = sum(1 for k0, k1 in zip(ks, ks[1:]) if sigs[k0] != sigs[k1])
     for k in ks:
-        win = [j for j in ks if abs(j - k) <= 10]
+        win = [j for j in ks if abs(j - k) <= 20]
         mode = Counter(sigs[j] for j in win).most_common(1)[0][0]
         same = [j for j in win if sigs[j] == mode]
         rep = min(same, key=lambda j: abs(j - k))

@@ -70,7 +70,7 @@ job_video() {
   rm -rf "$out"; mkdir -p "$out"
   blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
     --scene "$scene" --start "$start" --end "$end" --out "$out" --samples "$samples" "$@" 2>&1 \
-    | grep -E "^\[seq\]|Error|Traceback|line [0-9]+" || return 1
+    | grep --line-buffered -E "^\[seq\]|Error|Traceback|line [0-9]+" || return 1
   local fps; fps=$(python3 -c "import json;print(json.load(open('phase2_output/scene$scene/detections.json'))['fps'])")
   local v; v=$(ls P3Data/Sequences/scene$scene/Undist/*-front_undistort.mp4 | head -1)
   ffmpeg -loglevel error -y -i "$v" -vf "select=between(n\,$start\,$end),setpts=N/FRAME_RATE/TB,scale=960:720" \
