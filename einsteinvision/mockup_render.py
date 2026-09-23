@@ -32,6 +32,9 @@ from mathutils import Matrix, Vector
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import road_model as rm   # noqa: E402
+import infra              # noqa: E402
+
+JUNCTION = None      # intersection ahead (infra.find_junction) or None
 
 ROAD = None          # derived road (road_model.derive) for the current frame, or None
 SIGNALS = []         # traffic lights for the current frame (tl_state.py)
@@ -91,9 +94,10 @@ ASSET_SPEC = {
     "Dustbin.blend":                    ((90, 0, 0),  2, 1.0),
 }
 
-# Assets whose model faces backward (-Y) in the .blend (user-verified 2026-09-23):
-# sedan/hatchback faces forward; SUV (jeep) and truck are reversed.
-ASSET_FLIP = {"Vehicles/SUV.blend", "Vehicles/Truck.blend"}
+# Assets whose front faces -Y (Blender "front" convention) → need 180° so they drive +Y.
+# Measured from height profiles (asset_front.py, 2026-09-23): sedan & pickup face -Y;
+# SUV (jeep), truck, motorcycle face +Y — matches user: "car forward, truck & jeep opposite".
+ASSET_FLIP = {"Vehicles/SedanAndHatchback.blend", "Vehicles/PickupTruck.blend"}
 
 EGO_SPEED = 25.0       # m/s assumed ego speed (scene1 highway) for absolute heading
 MAX_YAW = math.radians(8)      # highway lane change ≈ 5–8°; more = depth noise
@@ -276,7 +280,7 @@ def layout_objects(frames: list, fi: int, fps: float, max_depth: float = 110.0, 
                     edge = ROAD["right"] + 1.2 if off > (lo + ROAD["right"]) / 2 - 1.0 else lo - 1.2
                     x = rm.x_at(ROAD, edge, z)
             placed.append(dict(cls=cls, sub="stop", asset=asset, x=x, y=z,
-                               yaw=-math.pi / 2 + (rm.heading_at(ROAD, z) if ROAD else 0.0),
+                               yaw=math.pi / 2 + (rm.heading_at(ROAD, z) if ROAD else 0.0),
                                bbox=list(o["bbox_2d"]), dims=(0.75, 0.1, 2.6), moving=False,
                                intent={}))
             continue
@@ -535,6 +539,13 @@ def _merge(parts):
 
 
 def _line_parts(road, L, y0, y1, lw=0.15):
+    if JUNCTION is not None and y0 < JUNCTION["y0"] - 4.6 < y1:
+        return (_line_parts_span(road, L, y0, JUNCTION["y0"] - 4.6, lw)
+                + _line_parts_span(road, L, JUNCTION["y1"] + 3.6, y1, lw))
+    return _line_parts_span(road, L, y0, y1, lw)
+
+
+def _line_parts_span(road, L, y0, y1, lw=0.15):
     parts = []
     offs = [L["a"]]
     if L.get("double"):
@@ -895,11 +906,20 @@ def style_C(scene, col, assets, placed):
     yellow = mat_principled("PaintY", (0.85, 0.6, 0.08), rough=0.55)
     concrete = mat_principled("Concrete", (0.45, 0.44, 0.42), rough=0.85)
     steel = mat_principled("Galvanised", (0.55, 0.56, 0.58), rough=0.35, metal=0.9)
+    road = infra.pbr_material("AsphaltPBR", infra.EXTRA / "textures/asphalt_02", 0.25) or road
+    walk = infra.pbr_material("SidewalkPBR", infra.EXTRA / "textures/concrete_floor_02", 0.4) or \
+        mat_principled("Sidewalk", (0.5, 0.5, 0.48), rough=0.8)
     if ROAD is not None:
         build_road_curved(scene.collection, ROAD, road, grass, white, yellow)
+        if JUNCTION is not None:
+            infra.build_junction(scene.collection, ROAD, JUNCTION, road, white, yellow)
+        if ROAD["median"] != "barrier":
+            infra.build_sidewalks(scene.collection, ROAD, JUNCTION, walk, concrete)
+        infra.scatter_furniture(scene.collection, ROAD, JUNCTION)
         if ROAD["median"] == "barrier":
             build_divider_curved(scene.collection, ROAD, concrete, ROAD["barrier_a"])
-        build_guardrail_curved(scene.collection, ROAD, steel, ROAD["right"] + 1.0)
+        if ROAD["median"] == "barrier":
+            build_guardrail_curved(scene.collection, ROAD, steel, ROAD["right"] + 1.0)
     else:
         build_road(scene.collection, road, grass, white, yellow)
         build_divider(scene.collection, concrete, None, BARRIER_X)
@@ -948,6 +968,10 @@ def main(argv):
         print(f"   {p['cls']:8s} {str(p['sub']):10s} x={p['x']:6.1f} y={p['y']:6.1f} "
               f"heading={math.degrees(p['yaw']):+5.1f}deg flip={p['asset'] in ASSET_FLIP}")
 
+    global JUNCTION
+    JUNCTION = infra.find_junction(placed, SIGNALS, ROAD) if ROAD is not None else None
+    if JUNCTION:
+        print(f"[mockup] junction {JUNCTION['kind']} y={JUNCTION['y0']:.1f}-{JUNCTION['y1']:.1f} cues={JUNCTION['why']}")
     scene = reset_scene()
     scene.render.resolution_x, scene.render.resolution_y = a.res
     scene.render.film_transparent = False
@@ -968,6 +992,9 @@ def main(argv):
         if per_asset and p["asset"] in per_asset:
             ov = per_asset[p["asset"]]
         tpl = asset_template(assets, p["asset"], override=ov, fill=fill)
+        if p["asset"] == "StopSign.blend" and not tpl.get("textured"):
+            infra.texture_plate(tpl, assets / "StopSignImage.png", "StopSign")
+            tpl["textured"] = True
         instance(tpl, f"Obj_{i}_{p['cls']}", p["x"], p["y"], p["yaw"], col,
                  flip=(p["asset"] in ASSET_FLIP) != a.flip_all)
 
