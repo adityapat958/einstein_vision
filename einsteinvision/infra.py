@@ -317,6 +317,7 @@ def ph_template(name):
         for o in objs:
             if o.parent is None:
                 o.location.z -= zmin
+    colT.use_fake_user = True
     _PH[name] = colT
     return colT
 

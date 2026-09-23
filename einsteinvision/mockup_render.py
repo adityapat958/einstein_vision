@@ -411,6 +411,7 @@ def asset_template(assets_dir: Path, rel: str, override=None, fill=None):
         elif fill is not None and not any(o.data.materials):
             o.data.materials.clear()
             o.data.materials.append(fill)
+    col.use_fake_user = True          # survive orphans_purge in the sequence renderer
     _TEMPLATES[key] = col
     return col
 
