@@ -161,8 +161,14 @@ def _setup_world() -> None:
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete()
 
-    # ── Render engine ─────────────────────────────────────────────────────
-    scene.render.engine = "BLENDER_EEVEE_NEXT"
+    # ── Render engine (version-robust) ────────────────────────────────────
+    _engines = scene.render.bl_rna.properties["engine"].enum_items.keys()
+    if "BLENDER_EEVEE_NEXT" in _engines:
+        scene.render.engine = "BLENDER_EEVEE_NEXT"   # Blender 4.2+
+    elif "BLENDER_EEVEE" in _engines:
+        scene.render.engine = "BLENDER_EEVEE"        # Blender <=4.1 / 3.x
+    else:
+        scene.render.engine = "CYCLES"
     scene.render.resolution_x = 1920
     scene.render.resolution_y = 1080
     scene.render.image_settings.file_format = "PNG"
@@ -629,6 +635,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
                    help="Minimum lane confidence to render")
     p.add_argument("--output", default=None,
                    help="Render output path/pattern (e.g. renders/frame_####.png)")
+    p.add_argument("--max-frames", dest="max_frames", type=int, default=0,
+                   help="Cap number of rendered frames for preview (0 = all)")
     return p
 
 
@@ -655,6 +663,11 @@ def main(argv: list[str] | None = None) -> None:
 
     # Headless render (only with --output)
     if args.output and bpy is not None:
+        if args.max_frames and args.max_frames > 0:
+            bpy.context.scene.frame_end = min(
+                bpy.context.scene.frame_end,
+                bpy.context.scene.frame_start + args.max_frames - 1,
+            )
         bpy.context.scene.render.filepath = args.output
         bpy.ops.render.render(animation=True)
 
