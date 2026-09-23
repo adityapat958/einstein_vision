@@ -30,8 +30,23 @@ from pathlib import Path
 import bpy
 from mathutils import Matrix, Vector
 
-# ── Camera intrinsics (front camera, from lane_report_style.json meta) ────────
-FX, CX = 1594.7, 654.3
+# ── Camera (front, undistorted 1280x960) ─────────────────────────────────────
+FX, CX, FY, CY = 1594.7, 654.3, 1607.7, 413.4
+IMG_W, IMG_H = 1280, 960
+CAM_H = 1.45          # m, windshield camera height
+V_HORIZON = 444.0     # px — median over 2485 scene1 cars (IQR 438–452); ≈1.1° pitch up
+
+# Real-world vehicle dims (w, l, h) m. Assets are scaled PER AXIS to these,
+# so every model has correct proportions regardless of how it was modelled.
+VEH_DIMS = {
+    "Vehicles/SedanAndHatchback.blend": (1.85, 4.70, 1.45),
+    "Vehicles/SUV.blend":               (1.95, 4.70, 1.80),
+    "Vehicles/PickupTruck.blend":       (2.00, 5.60, 1.90),
+    "Vehicles/Truck.blend":             (2.55, 8.50, 3.60),
+    "Vehicles/Motorcycle.blend":        (0.80, 2.10, 1.20),
+    "Vehicles/Bicycle.blend":           (0.60, 1.75, 1.10),
+}
+MIN_GAP = 0.8         # m, bumper-to-bumper minimum after overlap resolution
 
 # class → (real width m for depth-from-width, asset file)
 CLASS_INFO = {
@@ -70,11 +85,22 @@ ASSET_SPEC = {
     "Dustbin.blend":                    ((90, 0, 0),  2, 1.0),
 }
 
+# Assets whose model faces backward (-Y) in the .blend (user-verified 2026-09-23):
+# sedan/hatchback faces forward; SUV (jeep) and truck are reversed.
+ASSET_FLIP = {"Vehicles/SUV.blend", "Vehicles/Truck.blend"}
+
+EGO_SPEED = 25.0       # m/s assumed ego speed (scene1 highway) for absolute heading
+MAX_YAW = math.radians(8)      # highway lane change ≈ 5–8°; more = depth noise
+VX_DEADBAND = 0.6              # m/s lateral; below → lane-aligned
+
 LANE_W = 3.7
 # Road layout for scene1 frame 2131 (multi-lane highway, ego lane index 0).
 LANE_CENTERS = [LANE_W * k for k in range(-5, 2)]      # -18.5 .. 3.7
 ROAD_LEFT = LANE_CENTERS[0] - LANE_W / 2               # -20.35
 ROAD_RIGHT = LANE_CENTERS[-1] + LANE_W / 2             # 5.55
+BARRIER_X = ROAD_LEFT - 0.9                            # median Jersey barrier
+ONC_RIGHT = BARRIER_X - 0.9                            # oncoming carriageway (4 lanes)
+ONC_LEFT = ONC_RIGHT - 4 * LANE_W
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -88,36 +114,162 @@ def _iou(a, b):
     return inter / ua if ua > 0 else 0.0
 
 
-def layout_objects(frame: dict, max_depth: float = 95.0, snap: float = 0.7):
+def _aspect(o):
+    x1, y1, x2, y2 = o["bbox_2d"]
+    return (y2 - y1) / max(x2 - x1, 1)
+
+
+def asset_for(o):
+    cls = o["class_name"]
+    if cls in ("truck", "bus") and _aspect(o) < 0.95:
+        return "Vehicles/PickupTruck.blend"          # rear view too flat for a box truck
+    if cls == "car":
+        return SUBCLASS_ASSET.get(o.get("sub_class") or "sedan", "Vehicles/SedanAndHatchback.blend")
+    return CLASS_INFO.get(cls, (1.85, None))[1]
+
+
+def obj_dims(o):
+    a = asset_for(o)
+    if a in VEH_DIMS:
+        return VEH_DIMS[a]
+    w = CLASS_INFO.get(o["class_name"], (0.6, None))[0]
+    return (w, w, 1.7)
+
+
+def _bottom_occluded(o, others):
+    x1, _, x2, y2 = o["bbox_2d"]
+    for b in others:
+        if b is o:
+            continue
+        bx1, by1, bx2, by2 = b["bbox_2d"]
+        ov = min(x2, bx2) - max(x1, bx1)
+        if ov > 0.3 * (x2 - x1) and by2 > y2 + 3 and by1 < y2:   # nearer box covers our bottom
+            return True
+    return False
+
+
+def depth_of(o, others=()):
+    """Distance (m) to the nearest face of the object, fused from
+    ground contact (bbox bottom on road plane) and side-aware width."""
+    x1, y1, x2, y2 = o["bbox_2d"]
+    W, L, _ = obj_dims(o)
+    t = abs((x1 + x2) / 2 - CX) / FX                 # tan(viewing angle)
+    zw = FX * (W + L * t / (1 + t)) / max(x2 - x1, 1)  # rear face + visible flank
+    if x1 <= 2 or x2 >= IMG_W - 2:
+        zw = None                                     # truncated at image side
+    zg = None
+    if y2 < IMG_H - 4 and y2 - V_HORIZON > 12 and not _bottom_occluded(o, others):
+        zg = FY * CAM_H / (y2 - V_HORIZON)
+    if zg is None and zw is None:
+        return FX * W / max(x2 - x1, 1)
+    if zg is None:
+        return zw
+    if zw is None:
+        return zg
+    sg = zg * zg / (FY * CAM_H) * 2.0 + 0.03 * zg      # 2 px bottom jitter
+    sw = 0.08 * zw + zw * 2.0 / max(x2 - x1, 1)        # model + 2 px width jitter
+    if abs(zg - zw) > 0.4 * min(zg, zw):              # disagree → trust the better-conditioned cue
+        return zg if y2 - V_HORIZON >= 40 else zw
+    return (zg / sg**2 + zw / sw**2) / (1 / sg**2 + 1 / sw**2)
+
+
+def _depth_xy(o, others=()):
+    """(x, y) of the object CENTRE on the ground plane."""
+    x1, _, x2, _ = o["bbox_2d"]
+    z = depth_of(o, others)
+    L = obj_dims(o)[1]
+    return ((x1 + x2) / 2 - CX) * z / FX, z + L / 2
+
+
+def resolve_overlaps(placed, ego_len=4.7, ego_w=1.85, iters=8):
+    """Push the farther vehicle back until footprints are ≥ MIN_GAP apart."""
+    for _ in range(iters):
+        moved = False
+        for p in placed:                                         # ego clearance
+            W, L = p["dims"][0], p["dims"][1]
+            if abs(p["x"]) < (W + ego_w) / 2 + 0.3:
+                ymin = ego_len / 2 + MIN_GAP + L / 2
+                if p["y"] < ymin:
+                    p["y"], moved = ymin, True
+        order = sorted(placed, key=lambda p: p["y"])
+        for i, a in enumerate(order):
+            for b in order[i + 1:]:
+                if abs(a["x"] - b["x"]) >= (a["dims"][0] + b["dims"][0]) / 2 + 0.3:
+                    continue
+                need = (a["dims"][1] + b["dims"][1]) / 2 + MIN_GAP
+                if b["y"] - a["y"] < need:
+                    b["y"], moved = a["y"] + need, True
+        if not moved:
+            break
+    return placed
+
+
+def motion_heading(frames, fi, oid, fps, win=18):
+    """Yaw (rad, CCW from +Y) of a track from its motion over ±win frames.
+
+    Relative velocity (vx, vy) comes from a least-squares fit of the track's
+    bbox-derived positions; absolute forward speed = EGO_SPEED + vy (same
+    carriageway traffic). Returns (yaw, rel_speed) or (None, 0)."""
+    ts, xs, ys = [], [], []
+    for f in frames[max(0, fi - win): fi + win + 1]:
+        for o in f["objects"]:
+            if str(o["object_id"]) == oid:
+                x, y = _depth_xy(o, f["objects"])
+                ts.append(f["frame_index"] / fps); xs.append(x); ys.append(y)
+    if len(ts) < 5:
+        return None, 0.0
+    tm = sum(ts) / len(ts)
+    den = sum((t - tm) ** 2 for t in ts) or 1e-9
+    vx = sum((t - tm) * (x - sum(xs) / len(xs)) for t, x in zip(ts, xs)) / den
+    vy = sum((t - tm) * (y - sum(ys) / len(ys)) for t, y in zip(ts, ys)) / den
+    fwd = max(EGO_SPEED + vy, 1.0)
+    # lateral error of x = (u-cx)·Z/fx grows with Z (bbox-width depth jitter,
+    # side faces entering the bbox) → distance-scaled dead-band
+    db = VX_DEADBAND + 0.03 * (sum(ys) / len(ys)) + 0.05 * abs(sum(xs) / len(xs))
+    vx = 0.0 if abs(vx) < db else vx - math.copysign(db, vx)
+    yaw = math.atan2(-vx, fwd)
+    return max(-MAX_YAW, min(MAX_YAW, yaw)), math.hypot(vx, vy)
+
+
+def layout_objects(frames: list, fi: int, fps: float, max_depth: float = 110.0, snap: float = 0.35):
+    frame = frames[fi]
     objs = [o for o in frame["objects"] if o["class_name"] not in SKIP]
     objs.sort(key=lambda o: -o.get("confidence", 0.5))
     kept = []
     for o in objs:                                   # NMS across classes
-        if all(_iou(o["bbox_2d"], k["bbox_2d"]) < 0.6 for k in kept):
+        dup = next((k for k in kept if _iou(o["bbox_2d"], k["bbox_2d"]) >= 0.6), None)
+        if dup is None:
             kept.append(o)
+        elif {dup["class_name"], o["class_name"]} == {"car", "truck"}:
+            # car/truck duplicate: box shape decides (truck rear h/w ≈ 1.2+, car ≈ 0.75)
+            want = "truck" if _aspect(o) >= 0.95 else "car"
+            if o["class_name"] == want and dup["class_name"] != want:
+                kept[kept.index(dup)] = o
 
     placed = []
     for o in kept:
         cls = o["class_name"]
-        width, asset = CLASS_INFO.get(cls, (1.85, None))
-        if cls == "car":
-            asset = SUBCLASS_ASSET.get(o.get("sub_class") or "sedan",
-                                       "Vehicles/SedanAndHatchback.blend")
+        asset = asset_for(o)
         if asset is None:
             continue
-        x1, y1, x2, y2 = o["bbox_2d"]
-        z = FX * width / max(x2 - x1, 1)
+        x, z = _depth_xy(o, kept)
         if z > max_depth:
             continue
-        x = ((x1 + x2) / 2 - CX) * z / FX
-        if asset.startswith("Vehicles/"):              # soft snap to lane centre
+        if asset.startswith("Vehicles/"):              # gentle snap, only if close
             lc = min(LANE_CENTERS, key=lambda c: abs(c - x))
-            x = x + snap * (lc - x)
+            if abs(lc - x) < 1.0:
+                x = x + snap * (lc - x)
+        yaw, _ = motion_heading(frames, fi, str(o["object_id"]), fps)
+        if yaw is None or o.get("motion_state") == "parked":
+            yaw = 0.0                                 # parked / short track → lane-aligned
+        if x < BARRIER_X:                             # beyond the median → oncoming traffic
+            yaw = math.pi - yaw
         placed.append(dict(cls=cls, sub=o.get("sub_class"), asset=asset,
-                           x=x, y=z, yaw=float(o.get("orientation_yaw_rad") or 0.0),
+                           x=x, y=z, yaw=yaw,
+                           bbox=list(o["bbox_2d"]), dims=obj_dims(o),
                            moving=o.get("motion_state") == "moving",
                            intent=o.get("intent") or {}))
-    return placed
+    return resolve_overlaps(placed)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -192,9 +344,13 @@ def asset_template(assets_dir: Path, rel: str, override=None, fill=None):
     pts = [R @ o.matrix_world @ Vector(c) for o in meshes for c in o.bound_box]
     mn = Vector([min(p[i] for p in pts) for i in range(3)])
     mx = Vector([max(p[i] for p in pts) for i in range(3)])
-    s = target / max(mx[axis] - mn[axis], 1e-9)
     T = Matrix.Translation((-(mn.x + mx.x) / 2, -(mn.y + mx.y) / 2, -mn.z))
-    N = Matrix.Scale(s, 4) @ T @ R
+    if rel in VEH_DIMS:
+        w, l, h = VEH_DIMS[rel]
+        S = Matrix.Diagonal((w / (mx.x - mn.x), l / (mx.y - mn.y), h / (mx.z - mn.z), 1.0))
+    else:
+        S = Matrix.Scale(target / max(mx[axis] - mn[axis], 1e-9), 4)
+    N = S @ T @ R
 
     col = bpy.data.collections.new(f"TPL_{Path(rel).stem}")
     for o in meshes:
@@ -211,13 +367,13 @@ def asset_template(assets_dir: Path, rel: str, override=None, fill=None):
     return col
 
 
-def instance(col_tpl, name, x, y, yaw, scene_col, heading_flip=True):
+def instance(col_tpl, name, x, y, yaw, scene_col, flip=False):
+    """yaw: CCW heading from +Y (direction of travel). flip: model faces -Y."""
     e = bpy.data.objects.new(name, None)
     e.instance_type = "COLLECTION"
     e.instance_collection = col_tpl
     e.location = (x, y, 0.0)
-    # Vehicles drive along +Y; assets face -Y by convention → flip 180°.
-    e.rotation_euler = (0, 0, (math.pi if heading_flip else 0.0) - yaw)
+    e.rotation_euler = (0, 0, yaw + (math.pi if flip else 0.0))
     scene_col.objects.link(e)
     return e
 
@@ -234,8 +390,21 @@ def build_road(col, road_mat, shoulder_mat, paint_white, paint_yellow, y0=-40, y
     # shoulder / ground
     v, f = quad_strips([(-400, 400, -400, 800)], z=-0.02)
     mesh_obj("Ground", v, f, shoulder_mat, col)
-    v, f = quad_strips([(ROAD_LEFT - 1.2, ROAD_RIGHT + 1.2, y0, y1)], z=0.0)
+    v, f = quad_strips([(ONC_LEFT - 1.2, ROAD_RIGHT + 1.2, y0, y1)], z=0.0)
     mesh_obj("Road", v, f, road_mat, col)
+    lw = 0.15
+    onc = []
+    for k in range(1, 4):
+        xl = ONC_RIGHT - k * LANE_W
+        y = y0
+        while y < y1:
+            onc.append((xl - lw / 2, xl + lw / 2, y, y + 3.0)); y += 12.0
+    onc += [(ONC_LEFT - lw / 2, ONC_LEFT + lw / 2, y0, y1)]
+    v, f = quad_strips(onc, z=0.012)
+    mesh_obj("OncomingLines", v, f, paint_white, col)
+    v, f = quad_strips([(ONC_RIGHT - 0.12 - lw / 2, ONC_RIGHT - 0.12 + lw / 2, y0, y1),
+                        (ONC_RIGHT + 0.12 - lw / 2, ONC_RIGHT + 0.12 + lw / 2, y0, y1)], z=0.012)
+    mesh_obj("OncomingYellow", v, f, paint_yellow, col)
 
     lw, dash, period = 0.15, 3.0, 12.0
     dashes = []
@@ -255,6 +424,50 @@ def build_road(col, road_mat, shoulder_mat, paint_white, paint_yellow, y0=-40, y
     mesh_obj("DoubleYellow", v, f, paint_yellow, col)
 
 
+def build_divider(col, body_mat, top_mat, x_c, y0=-40, y1=320, seg=6.0, gap=0.04):
+    """Concrete Jersey barrier (median divider), segmented every `seg` m."""
+    prof = [(-0.30, 0.0), (-0.25, 0.08), (-0.10, 0.33), (-0.075, 0.81),
+            (0.075, 0.81), (0.10, 0.33), (0.25, 0.08), (0.30, 0.0)]
+    v, f = [], []
+    y = y0
+    while y < y1:
+        ya, yb = y, y + seg - gap
+        i0 = len(v)
+        v += [(x_c + px, ya, pz) for px, pz in prof] + [(x_c + px, yb, pz) for px, pz in prof]
+        n = len(prof)
+        for k in range(n - 1):
+            f.append((i0 + k, i0 + k + 1, i0 + n + k + 1, i0 + n + k))
+        f.append(tuple(i0 + k for k in range(n))[::-1])      # front cap
+        f.append(tuple(i0 + n + k for k in range(n)))         # back cap
+        y += seg
+    ob = mesh_obj("MedianBarrier", v, f, body_mat, col)
+    for poly in ob.data.polygons:
+        poly.use_smooth = False
+    if top_mat is not None:     # thin glowing cap line so it reads on dark UI
+        tv, tf = quad_strips([(x_c - 0.06, x_c + 0.06, y0, y1)], z=0.815)
+        mesh_obj("MedianBarrierTop", tv, tf, top_mat, col)
+    return ob
+
+
+def build_guardrail(col, mat, x, y0=-40, y1=320, post_every=4.0):
+    """W-beam guardrail on posts along the right shoulder."""
+    v, f = [], []
+    for zb, zt in ((0.55, 0.62), (0.66, 0.78)):                 # two-tone beam faces
+        i = len(v)
+        v += [(x, y0, zb), (x, y1, zb), (x, y1, zt), (x, y0, zt)]
+        f.append((i, i + 1, i + 2, i + 3))
+    y = y0
+    while y < y1:                                                 # posts (thin boxes)
+        i = len(v)
+        a, b, c, d = x + 0.02, x + 0.17, y - 0.07, y + 0.07
+        for zz in (0.0, 0.75):
+            v += [(a, c, zz), (b, c, zz), (b, d, zz), (a, d, zz)]
+        f += [(i, i + 1, i + 5, i + 4), (i + 1, i + 2, i + 6, i + 5),
+              (i + 2, i + 3, i + 7, i + 6), (i + 3, i, i + 4, i + 7), (i + 4, i + 5, i + 6, i + 7)]
+        y += post_every
+    return mesh_obj("Guardrail", v, f, mat, col)
+
+
 def build_path_and_arrows(col, placed, path_mat, arrow_mat):
     # Planned ego path (Tesla-style translucent ribbon in ego lane)
     v, f = quad_strips([(-0.9, 0.9, 2.5, 38.0)], z=0.02)
@@ -269,17 +482,24 @@ def build_path_and_arrows(col, placed, path_mat, arrow_mat):
                  (0.0, 0.45, 0.03)]
         ob = mesh_obj(f"Chevron_{i}", verts, [(0, 3, 1), (3, 2, 1)], arrow_mat, col)
         ob.location = (cx, cy, 0)
-        ob.rotation_euler = (0, 0, -p["yaw"])
+        ob.rotation_euler = (0, 0, p["yaw"])
 
 
-def setup_camera(scene, col):
+def setup_camera(scene, col, cinematic=False):
     cam_d = bpy.data.cameras.new("ChaseCam")
-    cam_d.lens = 26
+    cam_d.lens = 32 if cinematic else 26
     cam_d.clip_end = 600
     cam = bpy.data.objects.new("ChaseCam", cam_d)
     col.objects.link(cam)
-    cam.location = (0.0, -11.5, 5.2)
-    look_at(cam, (0.0, 24.0, 0.0))
+    if cinematic:
+        cam.location = (0.6, -10.0, 3.4)
+        look_at(cam, (-0.8, 30.0, 0.6))
+        cam_d.dof.use_dof = True
+        cam_d.dof.focus_distance = 25.0
+        cam_d.dof.aperture_fstop = 5.6
+    else:
+        cam.location = (0.0, -11.5, 5.2)
+        look_at(cam, (0.0, 24.0, 0.0))
     scene.camera = cam
     return cam
 
@@ -393,6 +613,10 @@ def style_A(scene, col, assets, placed):
     white = mat_principled("PaintW", (0.8, 0.8, 0.8), emit=(0.85, 0.88, 0.95), emit_strength=1.6)
     yellow = mat_principled("PaintY", (0.9, 0.6, 0.1), emit=(1.0, 0.62, 0.12), emit_strength=1.4)
     build_road(scene.collection, road, ground, white, yellow)
+    build_divider(scene.collection,
+                  mat_principled("Barrier", (0.16, 0.17, 0.19), rough=0.45, coat=0.2),
+                  mat_principled("BarrierTop", (0.6, 0.7, 0.8), emit=(0.55, 0.7, 0.9), emit_strength=1.2),
+                  BARRIER_X)
     path = mat_principled("Path", (0.1, 0.35, 1.0), emit=(0.15, 0.45, 1.0),
                           emit_strength=1.2, alpha=0.35)
     arrow = mat_principled("Arrow", (0.2, 0.5, 1.0), emit=(0.25, 0.55, 1.0), emit_strength=3.0)
@@ -415,6 +639,7 @@ def style_B(scene, col, assets, placed):
     white = mat_principled("PaintW", (0.95, 0.95, 0.95), rough=0.6)
     yellow = mat_principled("PaintY", (0.95, 0.68, 0.12), rough=0.6)
     build_road(scene.collection, road, ground, white, yellow)
+    build_divider(scene.collection, mat_principled("Barrier", (0.62, 0.62, 0.6), rough=0.8), None, BARRIER_X)
     path = mat_principled("Path", (0.15, 0.45, 1.0), emit=(0.2, 0.5, 1.0),
                           emit_strength=0.4, alpha=0.45)
     arrow = mat_principled("Arrow", (0.1, 0.4, 1.0), emit=(0.15, 0.45, 1.0), emit_strength=1.0)
@@ -432,7 +657,7 @@ def style_B(scene, col, assets, placed):
 
 def style_C(scene, col, assets, placed):
     """Cinematic — Cycles, sky, asphalt, original materials."""
-    cycles_gpu(scene, 128)
+    cycles_gpu(scene, 192)
     color_mgmt(scene, "AgX - Medium High Contrast", 0.0)
     world_sky(scene, 24, 200, 0.25)
 
@@ -471,7 +696,10 @@ def style_C(scene, col, assets, placed):
     white = mat_principled("PaintW", (0.82, 0.82, 0.8), rough=0.55)
     yellow = mat_principled("PaintY", (0.85, 0.6, 0.08), rough=0.55)
     build_road(scene.collection, road, grass, white, yellow)
-    add_sun(scene.collection, 3.2, 1.5, rot=(62, 0, 200), color=(1.0, 0.95, 0.88))
+    build_divider(scene.collection, mat_principled("Concrete", (0.45, 0.44, 0.42), rough=0.85), None, BARRIER_X)
+    build_guardrail(scene.collection, mat_principled("Galvanised", (0.55, 0.56, 0.58), rough=0.35, metal=0.9),
+                    ROAD_RIGHT + 1.0)
+    add_sun(scene.collection, 3.6, 1.2, rot=(58, 0, 215), color=(1.0, 0.90, 0.78))
     fill = mat_principled("CarPaint", (0.25, 0.27, 0.3), rough=0.25, metal=0.6, coat=1.0)
     ego_m = mat_principled("Ego", (0.8, 0.02, 0.02), rough=0.2, metal=0.5, coat=1.0)
     return None, ego_m, {"__fill__": fill}
@@ -482,6 +710,7 @@ STYLES = {"A": style_A, "B": style_B, "C": style_C}
 
 # ═════════════════════════════════════════════════════════════════════════════
 def main(argv):
+    global EGO_SPEED
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", required=True)
     ap.add_argument("--frame", type=int, default=2131)
@@ -489,15 +718,19 @@ def main(argv):
     ap.add_argument("--style", choices=list(STYLES), default="A")
     ap.add_argument("--out", required=True)
     ap.add_argument("--res", type=int, nargs=2, default=(1920, 1080))
-    ap.add_argument("--no-flip", action="store_true", help="don't rotate assets 180°")
+    ap.add_argument("--flip-all", action="store_true", help="invert every asset's facing (debug)")
+    ap.add_argument("--ego-speed", type=float, default=EGO_SPEED)
     a = ap.parse_args(argv)
 
     data = json.loads(Path(a.json).read_text())
-    frame = next(f for f in data["frames"] if f["frame_index"] == a.frame)
-    placed = layout_objects(frame)
+    EGO_SPEED = a.ego_speed
+    frames = data["frames"]
+    fi = next(i for i, f in enumerate(frames) if f["frame_index"] == a.frame)
+    placed = layout_objects(frames, fi, float(data.get("fps", 30.0)))
     print(f"[mockup] frame {a.frame}: {len(placed)} objects after NMS")
     for p in placed:
-        print(f"   {p['cls']:8s} {str(p['sub']):10s} x={p['x']:6.1f} y={p['y']:6.1f} yaw={p['yaw']:+.2f}")
+        print(f"   {p['cls']:8s} {str(p['sub']):10s} x={p['x']:6.1f} y={p['y']:6.1f} "
+              f"heading={math.degrees(p['yaw']):+5.1f}deg flip={p['asset'] in ASSET_FLIP}")
 
     scene = reset_scene()
     scene.render.resolution_x, scene.render.resolution_y = a.res
@@ -511,7 +744,8 @@ def main(argv):
 
     # Ego vehicle (separate template so it can take its own material)
     ego_tpl = asset_template_copy(assets, "Vehicles/SedanAndHatchback.blend", ego_mat)
-    instance(ego_tpl, "Ego", 0.0, 0.0, 0.0, col, heading_flip=not a.no_flip)
+    instance(ego_tpl, "Ego", 0.0, 0.0, 0.0, col,
+             flip=("Vehicles/SedanAndHatchback.blend" in ASSET_FLIP) != a.flip_all)
 
     for i, p in enumerate(placed):
         ov = override
@@ -519,9 +753,9 @@ def main(argv):
             ov = per_asset[p["asset"]]
         tpl = asset_template(assets, p["asset"], override=ov, fill=fill)
         instance(tpl, f"Obj_{i}_{p['cls']}", p["x"], p["y"], p["yaw"], col,
-                 heading_flip=not a.no_flip)
+                 flip=(p["asset"] in ASSET_FLIP) != a.flip_all)
 
-    setup_camera(scene, col)
+    setup_camera(scene, col, cinematic=(a.style == "C"))
     scene.render.filepath = str(Path(a.out).resolve())
     bpy.ops.render.render(write_still=True)
     print(f"[mockup] wrote {scene.render.filepath}")
