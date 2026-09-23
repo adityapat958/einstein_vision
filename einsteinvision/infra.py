@@ -332,6 +332,9 @@ def _inst(tpl, name, x, y, yaw, col, scale=1.0):
     return e
 
 
+SCATTER_GREENERY_AND_POLES = False     # user: no trees / poles / lamp posts
+
+
 def scatter_furniture(col, road, J, seed=7, y0=-10.0, y1=200.0):
     rnd = random.Random(seed)
     city = road["median"] != "barrier"
@@ -342,7 +345,7 @@ def scatter_furniture(col, road, J, seed=7, y0=-10.0, y1=200.0):
     def free(y):
         return J is None or not (J["y0"] - 6 < y < J["y1"] + 6)
 
-    lamp = ph_template("street_lamp_01") or ph_template("street_lamp_02")
+    lamp = (ph_template("street_lamp_01") or ph_template("street_lamp_02")) if SCATTER_GREENERY_AND_POLES else None
     if lamp:
         step = 32.0 if city else 45.0
         y = y0 + 8
@@ -355,7 +358,7 @@ def scatter_furniture(col, road, J, seed=7, y0=-10.0, y1=200.0):
                           rm.heading_at(road, y) - math.pi / 2, col)
                 placed += 1
             y += step
-    if not city:
+    if not city and SCATTER_GREENERY_AND_POLES:
         pole = ph_template("modular_electricity_poles")
         if pole:
             y = y0 + 20
@@ -363,7 +366,7 @@ def scatter_furniture(col, road, J, seed=7, y0=-10.0, y1=200.0):
                 _inst(pole, "Pole", rm.x_at(road, right_a + 9.0, y), y, rm.heading_at(road, y), col)
                 y += 55.0
     greens = [t for t in (ph_template(n) for n in ("tree_small_02", "shrub_01", "shrub_02", "shrub_04",
-                                                   "jacaranda_tree")) if t]
+                                                   "jacaranda_tree")) if t] if SCATTER_GREENERY_AND_POLES else []
     if greens:
         for side_a, sgn in ((right_a, 1), (left_a, -1)):
             y = y0 + rnd.uniform(0, 10)

@@ -61,3 +61,25 @@ job_road() {
 job_showcase() {
   for sf in "$@"; do job_mockup C "${sf%%:*}" "${sf##*:}" || return 1; done
 }
+
+# Smoothed sequence video, camera | render side by side.
+#   vizjob run video -- 1 1900 2140 [samples] [extra sequence_render args]
+job_video() {
+  local scene=${1:-1} start=${2:-1900} end=${3:-2140} samples=${4:-48}; shift 4 2>/dev/null || shift $#
+  local out="renders/scene${scene}_${start}_${end}"
+  rm -rf "$out"; mkdir -p "$out"
+  blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
+    --scene "$scene" --start "$start" --end "$end" --out "$out" --samples "$samples" "$@" 2>&1 \
+    | grep -E "^\[seq\]|Error|Traceback|line [0-9]+" || return 1
+  local fps; fps=$(python3 -c "import json;print(json.load(open('phase2_output/scene$scene/detections.json'))['fps'])")
+  local v; v=$(ls P3Data/Sequences/scene$scene/Undist/*-front_undistort.mp4 | head -1)
+  ffmpeg -loglevel error -y -i "$v" -vf "select=between(n\,$start\,$end),setpts=N/FRAME_RATE/TB,scale=960:720" \
+    -vsync 0 "$out/cam_%05d.png" || return 1
+  ffmpeg -loglevel error -y -framerate "$fps" -start_number 1 -i "$out/cam_%05d.png" \
+    -framerate "$fps" -start_number "$start" -i "$out/frame_%05d.png" \
+    -filter_complex "[1:v]scale=1280:720[r];[0:v][r]hstack=inputs=2,format=yuv420p" \
+    -c:v libx264 -crf 27 -preset slow "$out/scene${scene}_${start}_${end}.mp4" || return 1
+  ls -la "$out"/*.mp4
+  vj-post image "$out/scene${scene}_${start}_${end}.mp4" \
+    "scene$scene frames $start-$end · camera | render (smoothed) · $(cat $out/jitter.json)"
+}

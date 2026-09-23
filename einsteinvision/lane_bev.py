@@ -208,6 +208,48 @@ class Tracker:
         return out
 
 
+ODO_Z0, ODO_Z1 = 6.0, 36.0
+
+
+def dash_profile(mask, lines, b, c):
+    """Mean paint occupancy along z for all tracked dashed lines (fresh ones)."""
+    zs = np.arange(ODO_Z0, ODO_Z1, DZ)
+    rows = ((Z_MAX - zs) / DZ).astype(int)
+    profs = []
+    for L in lines:
+        if L["style"] != "dashed" or L["stale"] > 2:
+            continue
+        xc = L["a"] + b * zs + c * zs * zs
+        cols = ((xc - X_MIN) / DX).astype(int)
+        pr = np.zeros(len(zs), np.float32)
+        for k, (r, cc) in enumerate(zip(rows, cols)):
+            if 0 <= r < BH and 6 <= cc < BW - 6:
+                pr[k] = mask[r, cc - 6:cc + 7].any()
+        if pr.sum() >= 15 and pr.mean() < 0.7:          # real dashes: some paint, some gaps
+            profs.append(pr)
+    if not profs:
+        return None
+    return np.mean(profs, axis=0)
+
+
+def match_shift(prev, cur, max_ds=2.2):
+    """ds (m) maximising NCC of cur(z) vs prev(z + ds); returns (ds, score) or (None, score)."""
+    best, bs = None, -1.0
+    n = len(cur)
+    for k in range(0, int(max_ds / DZ) + 1):
+        a = cur[: n - k]
+        b_ = prev[k:]
+        if a.std() < 1e-3 or b_.std() < 1e-3:
+            continue
+        sc = float(np.corrcoef(a, b_)[0, 1])
+        if sc > bs:
+            best, bs = k, sc
+    if best is None or bs < 0.55:
+        return None, bs
+    # sub-pixel parabola
+    return float(best * DZ), bs
+
+
 def draw_debug(frame, bev, white, yellow, lines_fit, trk_state, b, c, out_png):
     vis = bev.copy()
     vis[white] = (255, 255, 255); vis[yellow] = (0, 220, 255)
@@ -248,6 +290,10 @@ def main():
     cap.set(cv2.CAP_PROP_POS_FRAMES, a.start)
     trk = Tracker()
     frames_out = []
+    prev_prof = None
+    r0, r1 = int((Z_MAX - 30.0) / DZ), int((Z_MAX - 6.0) / DZ)      # z 6–30 m
+    c0, c1 = int((-7.0 - X_MIN) / DX), int((7.0 - X_MIN) / DX)        # |x| < 7 m
+    win = cv2.createHanningWindow((c1 - c0, r1 - r0), cv2.CV_32F)
     dbg = set(a.debug_frames)
     for fi in range(a.start, end):
         ok, frame = cap.read()
@@ -255,6 +301,7 @@ def main():
             break
         bev = cv2.remap(frame, mu, mv, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
         white, yellow = marking_masks(bev)
+
         lines = trace_lines(white | yellow, xs, zs)
         dets, b, c = [], trk.b, trk.c
         if lines:
@@ -269,8 +316,16 @@ def main():
                 dets.append(d)
         trk.update(dets, b, c)
         st = trk.state()
+        # ego odometry from dashed paint: profile along each dashed line (z 6–36 m),
+        # marks move toward the camera → cur(z) ≈ prev(z + ds)
+        prof = dash_profile(white | yellow, st, trk.b, trk.c)
+        ds, dconf = None, 0.0
+        if prof is not None and prev_prof is not None:
+            ds, dconf = match_shift(prev_prof, prof)
+        prev_prof = prof
         frames_out.append(dict(frame_index=fi, b=round(trk.b, 5), c=round(trk.c, 7), lines=st,
-                               n_raw=len(dets)))
+                               n_raw=len(dets), ds=None if ds is None else round(ds, 4),
+                               ds_conf=round(float(dconf), 3)))
         if fi in dbg:
             p = out / "debug" / f"lanes_f{fi}.png"
             draw_debug(frame, bev, white, yellow, lines, st, trk.b, trk.c, p)
@@ -283,6 +338,15 @@ def main():
         if fi % 300 == 0:
             print(f"[lanes] {fi}/{end} lines={[(L['color'][0]+L['style'][0], L['a']) for L in st]} "
                   f"c={trk.c:+.5f}", flush=True)
+    # fill / smooth odometry: median over ±9 frames of valid ds, then cumulative distance s
+    dsv = np.array([f["ds"] if f["ds"] is not None else np.nan for f in frames_out], float)
+    sm = np.array([np.nanmedian(dsv[max(0, i - 9): i + 10]) if np.isfinite(dsv[max(0, i - 9): i + 10]).any()
+                   else np.nan for i in range(len(dsv))])
+    sm = np.where(np.isfinite(sm), sm, np.nanmedian(dsv) if np.isfinite(dsv).any() else 0.0)
+    S = np.cumsum(sm)
+    for f, d, s_ in zip(frames_out, sm, S):
+        f["ds_s"], f["s"] = round(float(d), 4), round(float(s_), 3)
+    print(f"[lanes] odometry: valid {np.isfinite(dsv).mean():.0%} of frames; median speed {np.median(sm) * fps * 3.6:.0f} km/h, distance {S[-1]:.0f} m")
     meta = dict(video=a.video, fps=fps, fx=FX, fy=FY, cx=CX, cy=CY, cam_h=CAM_H, v_horizon=V_HORIZON,
                 model="x = a + b z + c z^2 (ego frame, x right, z fwd, m)")
     (out / "road_model.json").write_text(json.dumps(dict(meta=meta, frames=frames_out)))

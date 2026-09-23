@@ -35,6 +35,7 @@ import road_model as rm   # noqa: E402
 import infra              # noqa: E402
 
 JUNCTION = None      # intersection ahead (infra.find_junction) or None
+DASH_PHASE = 0.0     # ego distance travelled (m) → world-fixed dashes / barrier joints scroll
 
 ROAD = None          # derived road (road_model.derive) for the current frame, or None
 SIGNALS = []         # traffic lights for the current frame (tl_state.py)
@@ -84,7 +85,7 @@ ASSET_SPEC = {
     "Vehicles/SedanAndHatchback.blend": ((0, 0, 0),   1, 4.7),
     "Vehicles/SUV.blend":               ((0, 0, 0),   1, 4.8),
     "Vehicles/Truck.blend":             ((0, 0, 0),   1, 9.5),
-    "Vehicles/PickupTruck.blend":       ((0, 0, 90),  1, 5.6),
+    "Vehicles/PickupTruck.blend":       ((90, 0, 90), 1, 5.6),   # model lies on its side: +Y is up
     "Vehicles/Motorcycle.blend":        ((90, 0, 90), 1, 2.1),
     "Vehicles/Bicycle.blend":           ((90, 0, 0),  1, 1.75),
     "Pedestrain.blend":                 ((90, 0, 0),  2, 1.75),
@@ -279,7 +280,7 @@ def layout_objects(frames: list, fi: int, fps: float, max_depth: float = 110.0, 
                 if lo - 1.0 < off < ROAD["right"] + 1.0:
                     edge = ROAD["right"] + 1.2 if off > (lo + ROAD["right"]) / 2 - 1.0 else lo - 1.2
                     x = rm.x_at(ROAD, edge, z)
-            placed.append(dict(cls=cls, sub="stop", asset=asset, x=x, y=z,
+            placed.append(dict(oid=str(o["object_id"]), cls=cls, sub="stop", asset=asset, x=x, y=z,
                                yaw=math.pi / 2 + (rm.heading_at(ROAD, z) if ROAD else 0.0),
                                bbox=list(o["bbox_2d"]), dims=(0.75, 0.1, 2.6), moving=False,
                                intent={}))
@@ -310,7 +311,7 @@ def layout_objects(frames: list, fi: int, fps: float, max_depth: float = 110.0, 
             yaw += rm.heading_at(ROAD, z)             # follow road curvature
         elif x < BARRIER_X:                           # beyond the median → oncoming traffic
             yaw = math.pi - yaw
-        placed.append(dict(cls=cls, sub=o.get("sub_class"), asset=asset,
+        placed.append(dict(oid=str(o["object_id"]), cls=cls, sub=o.get("sub_class"), asset=asset,
                            x=x, y=z, yaw=yaw,
                            bbox=list(o["bbox_2d"]), dims=obj_dims(o),
                            moving=o.get("motion_state") == "moving",
@@ -554,9 +555,11 @@ def _line_parts_span(road, L, y0, y1, lw=0.15):
         if L["style"] == "solid":
             parts.append(_ribbon(road, a - lw / 2, a + lw / 2, y0, y1, 0.012))
         else:                                              # 3 m dash / 9 m gap (US)
-            y = y0 - (y0 % 12.0)
+            y = y0 - ((y0 + DASH_PHASE) % 12.0)
             while y < y1:
-                parts.append(_ribbon(road, a - lw / 2, a + lw / 2, y, y + 3.0, 0.012, step=1.0))
+                ya, yb = max(y, y0), min(y + 3.0, y1)
+                if yb > ya:
+                    parts.append(_ribbon(road, a - lw / 2, a + lw / 2, ya, yb, 0.012, step=1.0))
                 y += 12.0
     return parts
 
@@ -583,7 +586,7 @@ def build_divider_curved(col, road, body_mat, a, y0=-40.0, y1=260.0, seg=6.0, ga
             (0.075, 0.81), (0.10, 0.33), (0.25, 0.08), (0.30, 0.0)]
     n = len(prof)
     v, f = [], []
-    y = y0
+    y = y0 - ((y0 + DASH_PHASE) % seg)
     while y < y1:
         for ya, yb in ((y, y + seg - gap),):
             i0 = len(v)
@@ -611,7 +614,7 @@ def build_guardrail_curved(col, road, mat, a, y0=-40.0, y1=260.0, post_every=4.0
                 k = len(vv) - 4
                 ff.append((k, k + 2, k + 3, k + 1))
         parts.append((vv, ff))
-    y = y0
+    y = y0 - ((y0 + DASH_PHASE) % post_every)
     while y < y1:
         x = rm.x_at(road, a, y)
         vv, ff = [], []
