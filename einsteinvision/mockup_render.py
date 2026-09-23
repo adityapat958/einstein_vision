@@ -30,6 +30,12 @@ from pathlib import Path
 import bpy
 from mathutils import Matrix, Vector
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import road_model as rm   # noqa: E402
+
+ROAD = None          # derived road (road_model.derive) for the current frame, or None
+SIGNALS = []         # traffic lights for the current frame (tl_state.py)
+
 # ── Camera (front, undistorted 1280x960) ─────────────────────────────────────
 FX, CX, FY, CY = 1594.7, 654.3, 1607.7, 413.4
 IMG_W, IMG_H = 1280, 960
@@ -222,13 +228,18 @@ def motion_heading(frames, fi, oid, fps, win=18):
     den = sum((t - tm) ** 2 for t in ts) or 1e-9
     vx = sum((t - tm) * (x - sum(xs) / len(xs)) for t, x in zip(ts, xs)) / den
     vy = sum((t - tm) * (y - sum(ys) / len(ys)) for t, y in zip(ts, ys)) / den
-    fwd = max(EGO_SPEED + vy, 1.0)
+    fwd = EGO_SPEED + vy                          # absolute forward speed (negative = oncoming)
     # lateral error of x = (u-cx)·Z/fx grows with Z (bbox-width depth jitter,
     # side faces entering the bbox) → distance-scaled dead-band
     db = VX_DEADBAND + 0.03 * (sum(ys) / len(ys)) + 0.05 * abs(sum(xs) / len(xs))
     vx = 0.0 if abs(vx) < db else vx - math.copysign(db, vx)
+    if abs(fwd) < 1.0:                            # ~stationary: lane-aligned
+        return 0.0, math.hypot(vx, vy)
     yaw = math.atan2(-vx, fwd)
-    return max(-MAX_YAW, min(MAX_YAW, yaw)), math.hypot(vx, vy)
+    base = 0.0 if abs(yaw) <= math.pi / 2 else math.copysign(math.pi, yaw)
+    cap = math.pi / 2 if abs(vx) > 5.0 and len(ts) >= 15 else MAX_YAW   # crossing traffic
+    dev = max(-cap, min(cap, yaw - base))
+    return base + dev, math.hypot(vx, vy)
 
 
 def layout_objects(frames: list, fi: int, fps: float, max_depth: float = 110.0, snap: float = 0.35):
@@ -250,26 +261,58 @@ def layout_objects(frames: list, fi: int, fps: float, max_depth: float = 110.0, 
     for o in kept:
         cls = o["class_name"]
         asset = asset_for(o)
-        if asset is None:
+        if asset is None or cls == "traffic light":   # signals: procedural, from tl_state.py
+            continue
+        if cls == "stop sign":                        # plate 0.75 m wide, on a post
+            x1, y1, x2, y2 = o["bbox_2d"]
+            z = FX * 0.75 / max(x2 - x1, 1)
+            if z > 70:
+                continue
+            x = ((x1 + x2) / 2 - CX) * z / FX
+            if ROAD is not None:                       # signs stand beside the carriageway
+                off = rm.offset_of(ROAD, x, z)
+                lo = min([l["a"] for l in ROAD["oncoming_lines"]], default=ROAD["left"])
+                if lo - 1.0 < off < ROAD["right"] + 1.0:
+                    edge = ROAD["right"] + 1.2 if off > (lo + ROAD["right"]) / 2 - 1.0 else lo - 1.2
+                    x = rm.x_at(ROAD, edge, z)
+            placed.append(dict(cls=cls, sub="stop", asset=asset, x=x, y=z,
+                               yaw=-math.pi / 2 + (rm.heading_at(ROAD, z) if ROAD else 0.0),
+                               bbox=list(o["bbox_2d"]), dims=(0.75, 0.1, 2.6), moving=False,
+                               intent={}))
             continue
         x, z = _depth_xy(o, kept)
         if z > max_depth:
             continue
         if asset.startswith("Vehicles/"):              # gentle snap, only if close
-            lc = min(LANE_CENTERS, key=lambda c: abs(c - x))
-            if abs(lc - x) < 1.0:
-                x = x + snap * (lc - x)
+            if ROAD is not None:
+                off = rm.offset_of(ROAD, x, z)
+                cs = rm.lane_centers(ROAD)
+                lc = min(cs, key=lambda c: abs(c - off)) if cs else off
+                if abs(lc - off) < 1.2:
+                    x = x + snap * (lc - off)
+            else:
+                lc = min(LANE_CENTERS, key=lambda c: abs(c - x))
+                if abs(lc - x) < 1.0:
+                    x = x + snap * (lc - x)
         yaw, _ = motion_heading(frames, fi, str(o["object_id"]), fps)
         if yaw is None or o.get("motion_state") == "parked":
             yaw = 0.0                                 # parked / short track → lane-aligned
-        if x < BARRIER_X:                             # beyond the median → oncoming traffic
+        if ROAD is not None:
+            onc = rm.is_oncoming(ROAD, x, z)
+            if onc and abs(yaw) < math.pi / 2:        # beyond median but motion unclear → oncoming
+                yaw = math.pi - yaw
+            elif not onc and abs(yaw) > math.pi / 2:  # our side of the median → same direction
+                yaw = math.pi - yaw
+            yaw += rm.heading_at(ROAD, z)             # follow road curvature
+        elif x < BARRIER_X:                           # beyond the median → oncoming traffic
             yaw = math.pi - yaw
         placed.append(dict(cls=cls, sub=o.get("sub_class"), asset=asset,
                            x=x, y=z, yaw=yaw,
                            bbox=list(o["bbox_2d"]), dims=obj_dims(o),
                            moving=o.get("motion_state") == "moving",
                            intent=o.get("intent") or {}))
-    return resolve_overlaps(placed)
+    resolve_overlaps([p for p in placed if p["asset"].startswith("Vehicles/")])
+    return placed
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -466,6 +509,161 @@ def build_guardrail(col, mat, x, y0=-40, y1=320, post_every=4.0):
               (i + 2, i + 3, i + 7, i + 6), (i + 3, i, i + 4, i + 7), (i + 4, i + 5, i + 6, i + 7)]
         y += post_every
     return mesh_obj("Guardrail", v, f, mat, col)
+
+
+# ─── curved road from road_model ────────────────────────────────────────────────
+def _ribbon(road, a0, a1, y0, y1, z, step=2.0):
+    """quad strip between offsets a0<a1 following the road curve."""
+    v, f = [], []
+    n = int((y1 - y0) / step)
+    for i in range(n + 1):
+        y = y0 + i * step
+        v += [(rm.x_at(road, a0, y), y, z), (rm.x_at(road, a1, y), y, z)]
+        if i:
+            k = len(v) - 4
+            f.append((k, k + 2, k + 3, k + 1))
+    return v, f
+
+
+def _merge(parts):
+    V, F = [], []
+    for v, f in parts:
+        o = len(V)
+        V += v
+        F += [tuple(i + o for i in q) for q in f]
+    return V, F
+
+
+def _line_parts(road, L, y0, y1, lw=0.15):
+    parts = []
+    offs = [L["a"]]
+    if L.get("double"):
+        offs = [L["a"] - 0.12, L["a"] + 0.12]
+    for a in offs:
+        if L["style"] == "solid":
+            parts.append(_ribbon(road, a - lw / 2, a + lw / 2, y0, y1, 0.012))
+        else:                                              # 3 m dash / 9 m gap (US)
+            y = y0 - (y0 % 12.0)
+            while y < y1:
+                parts.append(_ribbon(road, a - lw / 2, a + lw / 2, y, y + 3.0, 0.012, step=1.0))
+                y += 12.0
+    return parts
+
+
+def build_road_curved(col, road, road_mat, ground_mat, white, yellow, y0=-40.0, y1=260.0):
+    v, f = quad_strips([(-600, 600, -400, 900)], z=-0.02)
+    mesh_obj("Ground", v, f, ground_mat, col)
+    onc = road["oncoming_lines"]
+    a_lo = min([l["a"] for l in onc], default=road["left"]) - 1.2
+    a_hi = road["right"] + 1.5
+    v, f = _ribbon(road, a_lo, a_hi, y0, y1, 0.0)
+    mesh_obj("Road", v, f, road_mat, col)
+    W, Y = [], []
+    for L in road["lines"] + onc:
+        (Y if L["color"] == "yellow" else W).extend(_line_parts(road, L, y0, y1))
+    if W:
+        mesh_obj("LinesWhite", *_merge(W), white, col)
+    if Y:
+        mesh_obj("LinesYellow", *_merge(Y), yellow, col)
+
+
+def build_divider_curved(col, road, body_mat, a, y0=-40.0, y1=260.0, seg=6.0, gap=0.04):
+    prof = [(-0.30, 0.0), (-0.25, 0.08), (-0.10, 0.33), (-0.075, 0.81),
+            (0.075, 0.81), (0.10, 0.33), (0.25, 0.08), (0.30, 0.0)]
+    n = len(prof)
+    v, f = [], []
+    y = y0
+    while y < y1:
+        for ya, yb in ((y, y + seg - gap),):
+            i0 = len(v)
+            for yy in (ya, yb):
+                xc = rm.x_at(road, a, yy)
+                v += [(xc + px, yy, pz) for px, pz in prof]
+            for k in range(n - 1):
+                f.append((i0 + k, i0 + k + 1, i0 + n + k + 1, i0 + n + k))
+            f.append(tuple(i0 + k for k in range(n))[::-1])
+            f.append(tuple(i0 + n + k for k in range(n)))
+        y += seg
+    return mesh_obj("MedianBarrier", v, f, body_mat, col)
+
+
+def build_guardrail_curved(col, road, mat, a, y0=-40.0, y1=260.0, post_every=4.0):
+    parts = []
+    for zb, zt in ((0.55, 0.62), (0.66, 0.78)):
+        vv, ff = [], []
+        n = int((y1 - y0) / 2.0)
+        for i in range(n + 1):
+            y = y0 + i * 2.0
+            x = rm.x_at(road, a, y)
+            vv += [(x, y, zb), (x, y, zt)]
+            if i:
+                k = len(vv) - 4
+                ff.append((k, k + 2, k + 3, k + 1))
+        parts.append((vv, ff))
+    y = y0
+    while y < y1:
+        x = rm.x_at(road, a, y)
+        vv, ff = [], []
+        A, B, C, D = x + 0.02, x + 0.17, y - 0.07, y + 0.07
+        for zz in (0.0, 0.75):
+            vv += [(A, C, zz), (B, C, zz), (B, D, zz), (A, D, zz)]
+        ff = [(0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7), (4, 5, 6, 7)]
+        parts.append((vv, ff))
+        y += post_every
+    return mesh_obj("Guardrail", *_merge(parts), mat, col)
+
+
+# ─── traffic signals / signs ──────────────────────────────────────────────────
+_LAMP = {"red": (1.0, 0.03, 0.02), "yellow": (1.0, 0.55, 0.0), "green": (0.05, 1.0, 0.35)}
+
+
+def _box(cx, cy, cz, sx, sy, sz):
+    v = [(cx + dx * sx / 2, cy + dy * sy / 2, cz + dz * sz / 2)
+         for dz in (-1, 1) for dy in (-1, 1) for dx in (-1, 1)]
+    f = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+    return v, f
+
+
+def build_signals(col, signals, road):
+    """Procedural signal heads (housing + 3 lamps, lit lamp emissive) on mast arms."""
+    if not signals:
+        return
+    housing = mat_principled("SignalHousing", (0.02, 0.02, 0.022), rough=0.6)
+    pole = mat_principled("SignalPole", (0.35, 0.36, 0.37), rough=0.4, metal=0.8)
+    off = mat_principled("LampOff", (0.04, 0.04, 0.04), rough=0.3)
+    lit = {k: mat_principled(f"Lamp_{k}", c, rough=0.2, emit=c, emit_strength=40.0) for k, c in _LAMP.items()}
+    right_a = road["right"] + 2.0 if road else 7.0
+    arm_parts, pole_parts, house_parts = [], [], []
+    lamp_parts = {k: [] for k in ["off", "red", "yellow", "green"]}
+    seen_y = {}
+    for s in signals:
+        x, y, z = s["x"], s["y"], max(s["z"], 4.8)
+        if y < 8 or y > 140:
+            continue
+        key = round(y / 6.0)                  # heads at similar distance share one mast
+        house_parts.append(_box(x, y, z, 0.36, 0.3, 1.05))
+        for i, st in enumerate(("red", "yellow", "green")):
+            on = s.get("state") == st
+            lamp_parts[st if on else "off"].append(_box(x, y - 0.16, z + 0.33 - i * 0.33, 0.24, 0.02, 0.24))
+        px = rm.x_at(road, right_a, y) if road else right_a
+        arm_parts.append(_box((x + px) / 2, y, z + 0.6, abs(px - x) + 0.3, 0.14, 0.14))
+        if key not in seen_y:
+            seen_y[key] = True
+            pole_parts.append(_box(px, y, (z + 0.7) / 2, 0.25, 0.25, z + 0.7))
+    mesh_obj("SignalHousings", *_merge(house_parts), housing, col)
+    mesh_obj("SignalArms", *_merge(arm_parts + pole_parts), pole, col)
+    for k, parts in lamp_parts.items():
+        if parts:
+            mesh_obj(f"Lamps_{k}", *_merge(parts), off if k == "off" else lit[k], col)
+    for s in signals:                          # glow onto the scene
+        if s.get("state") in _LAMP and 8 <= s["y"] <= 80:
+            d = bpy.data.lights.new("SigGlow", "POINT")
+            d.energy = 60.0
+            d.color = _LAMP[s["state"]]
+            d.shadow_soft_size = 0.2
+            ob = bpy.data.objects.new("SigGlow", d)
+            ob.location = (s["x"], s["y"] - 0.6, max(s["z"], 4.8))
+            col.objects.link(ob)
 
 
 def build_path_and_arrows(col, placed, path_mat, arrow_mat):
@@ -695,10 +893,18 @@ def style_C(scene, col, assets, placed):
 
     white = mat_principled("PaintW", (0.82, 0.82, 0.8), rough=0.55)
     yellow = mat_principled("PaintY", (0.85, 0.6, 0.08), rough=0.55)
-    build_road(scene.collection, road, grass, white, yellow)
-    build_divider(scene.collection, mat_principled("Concrete", (0.45, 0.44, 0.42), rough=0.85), None, BARRIER_X)
-    build_guardrail(scene.collection, mat_principled("Galvanised", (0.55, 0.56, 0.58), rough=0.35, metal=0.9),
-                    ROAD_RIGHT + 1.0)
+    concrete = mat_principled("Concrete", (0.45, 0.44, 0.42), rough=0.85)
+    steel = mat_principled("Galvanised", (0.55, 0.56, 0.58), rough=0.35, metal=0.9)
+    if ROAD is not None:
+        build_road_curved(scene.collection, ROAD, road, grass, white, yellow)
+        if ROAD["median"] == "barrier":
+            build_divider_curved(scene.collection, ROAD, concrete, ROAD["barrier_a"])
+        build_guardrail_curved(scene.collection, ROAD, steel, ROAD["right"] + 1.0)
+    else:
+        build_road(scene.collection, road, grass, white, yellow)
+        build_divider(scene.collection, concrete, None, BARRIER_X)
+        build_guardrail(scene.collection, steel, ROAD_RIGHT + 1.0)
+    build_signals(scene.collection, SIGNALS, ROAD)
     add_sun(scene.collection, 3.6, 1.2, rot=(58, 0, 215), color=(1.0, 0.90, 0.78))
     fill = mat_principled("CarPaint", (0.25, 0.27, 0.3), rough=0.25, metal=0.6, coat=1.0)
     ego_m = mat_principled("Ego", (0.8, 0.02, 0.02), rough=0.2, metal=0.5, coat=1.0)
@@ -720,12 +926,22 @@ def main(argv):
     ap.add_argument("--res", type=int, nargs=2, default=(1920, 1080))
     ap.add_argument("--flip-all", action="store_true", help="invert every asset's facing (debug)")
     ap.add_argument("--ego-speed", type=float, default=EGO_SPEED)
+    ap.add_argument("--road", default=None, help="road/sceneN/road_model.json (lane_bev.py)")
+    ap.add_argument("--tl", default=None, help="road/sceneN/traffic_lights.json (tl_state.py)")
     a = ap.parse_args(argv)
 
     data = json.loads(Path(a.json).read_text())
     EGO_SPEED = a.ego_speed
     frames = data["frames"]
     fi = next(i for i, f in enumerate(frames) if f["frame_index"] == a.frame)
+    global ROAD, SIGNALS
+    if a.road and Path(a.road).exists():
+        ROAD = rm.derive(rm.load(a.road).get(a.frame))
+        print(f"[mockup] road: median={ROAD['median']} W={ROAD['W']:.2f} b={ROAD['b']:+.3f} "
+              f"c={ROAD['c']:+.6f} lines={[(round(l['a'],1), l['color'][0]+l['style'][0], 'syn' if l.get('synth') else 'det') for l in ROAD['lines']]}")
+    if a.tl and Path(a.tl).exists():
+        SIGNALS = json.loads(Path(a.tl).read_text()).get(str(a.frame), [])
+        print(f"[mockup] signals: {[(s['state'], s['x'], s['y'], s['z']) for s in SIGNALS]}")
     placed = layout_objects(frames, fi, float(data.get("fps", 30.0)))
     print(f"[mockup] frame {a.frame}: {len(placed)} objects after NMS")
     for p in placed:
