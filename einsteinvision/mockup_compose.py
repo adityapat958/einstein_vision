@@ -63,6 +63,43 @@ def sheet(out, imgs):
     s.save(out)
 
 
+def inset(render, objs_json, oid, out, scale=3):
+    """Paste a zoomed crop of vehicle `oid` (projected bbox from sequence_render --stills) top-right."""
+    import json
+    im = Image.open(render).convert("RGB")
+    rows = [r for r in json.load(open(objs_json)) if r["oid"] == str(oid)]
+    if rows:
+        x1, y1, x2, y2 = rows[0]["bbox"]
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        hw = max(x2 - x1, (y2 - y1) * 1.6, 40) * 0.75
+        box = (int(cx - hw), int(cy - hw / 1.6), int(cx + hw), int(cy + hw / 1.6))
+        crop = im.crop(box)
+        tw = im.width * 36 // 100
+        crop = crop.resize((tw, tw * crop.height // max(crop.width, 1)), Image.LANCZOS)
+        d = ImageDraw.Draw(im)
+        d.rectangle(box, outline=(0, 255, 255), width=2)
+        X = im.width - crop.width - 20
+        im.paste(crop, (X, 20))
+        d.rectangle((X - 2, 18, X + crop.width + 1, 21 + crop.height), outline=(0, 255, 255), width=3)
+        st = rows[0]["state"]
+        txt = f"t{oid}: {'PARKED' if st['parked'] else 'moving'} brake={st['brake']} ind={st['indicator']}"
+        d.text((X + 8, 26), txt, font=font(22), fill=(255, 255, 0))
+    else:
+        ImageDraw.Draw(im).text((im.width - 520, 26), f"t{oid}: not placed in render", font=font(24), fill=(255, 80, 80))
+    im.save(out)
+
+
+def vstack(out, imgs, w=1920):
+    ims = [Image.open(p).convert("RGB") for p in imgs]
+    ims = [i.resize((w, i.height * w // i.width)) for i in ims]
+    s = Image.new("RGB", (w, sum(i.height for i in ims)))
+    y = 0
+    for i in ims:
+        s.paste(i, (0, y))
+        y += i.height
+    s.save(out)
+
+
 if __name__ == "__main__":
     mode = sys.argv[1]
     if mode == "single":
@@ -71,5 +108,9 @@ if __name__ == "__main__":
         pair(*sys.argv[2:6])
     elif mode == "sheet":
         sheet(sys.argv[2], sys.argv[3:])
+    elif mode == "inset":
+        inset(*sys.argv[2:6])
+    elif mode == "vstack":
+        vstack(sys.argv[2], sys.argv[3:])
     else:
         sys.exit(__doc__)

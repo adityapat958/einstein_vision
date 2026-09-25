@@ -102,3 +102,46 @@ job_vstate() {
       "scene$s vehicle_state check sheet (real crops, cyan=lamp ROIs, label=prediction) · $summ"
   done
 }
+
+# Phase-3 render check: stills with vehicle_state visualised (brake lamps / blinking amber / parked
+# desaturated), camera | render pairs stacked into renders/phase3/check_sN.png (posted).
+#   vizjob run phase3 -- "1:500:87:indicator R" "3:1830:860:brake"      (scene:frame:track:caption)
+job_phase3() {
+  local specs=("$@")
+  [[ ${#specs[@]} -gt 0 ]] || specs=("1:486:87:right indicator (blink on phase)" "1:497:87:right indicator (blink off phase)" "1:990:377:braking" "1:655:337:parked"
+                                    "3:60:2:stopped/parked" "3:1662:604:braking" "3:1830:860:braking" "3:2070:959:braking")
+  mkdir -p renders/phase3/work
+  declare -A pairs
+  for sp in "${specs[@]}"; do
+    local s=${sp%%:*} rest=${sp#*:}; local f=${rest%%:*}; rest=${rest#*:}; local oid=${rest%%:*} txt="t${rest%%:*} ${rest#*:}"
+    local st=$((f - 45)); [[ $st -lt 0 ]] && st=0
+    local out=renders/phase3/work/s${s}_f${f}
+    rm -rf "$out"; mkdir -p "$out"
+    blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
+      --scene "$s" --start "$st" --end $((f + 45)) --stills "$f" --out "$out" --samples ${SAMPLES:-64} 2>&1 \
+      | grep --line-buffered -E "^\[seq\]|Error|Traceback|line [0-9]+"
+    [[ -f "$out/frame_$(printf %05d $f).png" ]] || { echo "no render for s$s f$f"; return 1; }
+    local ref; ref=$(_ref_frame "$s" "$f") || return 1
+    local fr="$out/frame_$(printf %05d $f)"
+    python3 einsteinvision/mockup_compose.py inset "$fr.png" "${fr}_objs.json" "$oid" "${fr}_inset.png" || return 1
+    python3 - "$fr" "$oid" "$ref" "$s" "$f" <<'PY'
+import json, sys; r = [o for o in json.load(open(sys.argv[1] + "_objs.json")) if o["oid"] == sys.argv[2]]
+print("[phase3] focus", sys.argv[2], r[0] if r else "NOT PLACED")
+from PIL import Image, ImageDraw            # cyan box on the camera frame = the detection being visualised
+d = json.load(open(f"phase2_output/scene{sys.argv[4]}/detections.json"))
+fr = next(f for f in d["frames"] if f["frame_index"] == int(sys.argv[5]))
+im = Image.open(sys.argv[3]).convert("RGB"); dr = ImageDraw.Draw(im)
+for o in fr["objects"]:
+    if str(o["object_id"]) == sys.argv[2]:
+        dr.rectangle(o["bbox_2d"], outline=(0, 255, 255), width=4)
+im.save(sys.argv[1] + "_ref.png")
+PY
+    python3 einsteinvision/mockup_compose.py pair "${fr}_inset.png" "${fr}_ref.png" \
+      "scene$s f$f · $txt" "$out/pair.png" || return 1
+    pairs[$s]+="$out/pair.png "
+  done
+  for s in "${!pairs[@]}"; do
+    python3 einsteinvision/mockup_compose.py vstack renders/phase3/check_s$s.png ${pairs[$s]} || return 1
+    vj-post image renders/phase3/check_s$s.png "phase3 check scene$s · camera | render (brake=red emissive, amber blink, parked desaturated)"
+  done
+}

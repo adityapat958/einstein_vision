@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mockup_render as mr   # noqa: E402
 import road_model as rm      # noqa: E402
 import infra                 # noqa: E402
+import vstate_render as vsr  # noqa: E402
 
 
 def gauss_smooth(series: dict[int, dict], sigma: float, keys=("x", "y")):
@@ -76,6 +77,32 @@ def road_signature(r):
             tuple(l["color"][0] + l["style"][0] for l in r["lines"]))
 
 
+def dump_boxes(scene, cam, placed, VS, k, path):
+    from bpy_extras.object_utils import world_to_camera_view
+    from mathutils import Vector
+    bpy.context.view_layer.update()
+    rx, ry = scene.render.resolution_x, scene.render.resolution_y
+    rows = []
+    for p in placed:
+        if not p["asset"].startswith("Vehicles/"):
+            continue
+        W, L, H = p["dims"]
+        c, s_ = math.cos(p["yaw"]), math.sin(p["yaw"])
+        pts = []
+        for dx in (-W / 2, W / 2):
+            for dy in (-L / 2, L / 2):
+                for z in (0.0, H):
+                    v = world_to_camera_view(scene, cam, Vector((p["x"] + c * dx - s_ * dy, p["y"] + s_ * dx + c * dy, z)))
+                    pts.append((v.x * rx, (1 - v.y) * ry, v.z))
+        if min(q[2] for q in pts) <= 0:
+            continue
+        rows.append(dict(oid=p["oid"], asset=p["asset"], x=round(p["x"], 2), y=round(p["y"], 2),
+                         yaw=round(p["yaw"], 3), state=VS.get(p["oid"], k),
+                         bbox=[round(min(q[0] for q in pts)), round(min(q[1] for q in pts)),
+                               round(max(q[0] for q in pts)), round(max(q[1] for q in pts))]))
+    Path(path).write_text(json.dumps(rows, indent=1))
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", type=int, required=True)
@@ -88,6 +115,9 @@ def main(argv):
     ap.add_argument("--sigma", type=float, default=3.5)
     ap.add_argument("--raw", action="store_true", help="no smoothing (for comparison)")
     ap.add_argument("--analyze", action="store_true", help="print jitter by distance, no render")
+    ap.add_argument("--stills", type=int, nargs="*", default=None,
+                    help="lay out/smooth the whole range but render only these frames")
+    ap.add_argument("--no-vstate", action="store_true", help="ignore road/sceneN/vehicle_state.json")
     a = ap.parse_args(argv)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -100,6 +130,9 @@ def main(argv):
     tlp = Path(f"road/scene{a.scene}/traffic_lights.json")
     TL = json.loads(tlp.read_text()) if tlp.exists() else {}
     ks = [k for k in range(a.start, a.end + 1) if k in idx and k in R]
+    # Phase-3 semantics: parked/moving, brake lamps, indicators (vehicle_state.py sidecar)
+    VS = vsr.VehicleState(f"road/scene{a.scene}/vehicle_state.json") if not a.no_vstate else vsr.VehicleState("")
+    print(f"[seq] vehicle_state: {len(VS.tracks)} tracks" if VS else "[seq] vehicle_state: none")
 
     # ── 1. per-frame layout ──────────────────────────────────────────────────
     t0 = time.time()
@@ -186,7 +219,9 @@ def main(argv):
     col = scene.collection
     ego_tpl = None
     t0 = time.time()
-    for n, k in enumerate(ks):
+    rks = [k for k in ks if a.stills is None or k in set(a.stills)]
+    nstat = Counter()
+    for n, k in enumerate(rks):
         for ob in list(col.all_objects):
             bpy.data.objects.remove(ob, do_unlink=True)
         for c in list(col.children):
@@ -205,18 +240,31 @@ def main(argv):
                     flip="Vehicles/SedanAndHatchback.blend" in mr.ASSET_FLIP)
         for i, p in enumerate(placed):
             tpl = mr.asset_template(assets, p["asset"], override=override, fill=fill)
+            if VS and p["asset"].startswith("Vehicles/"):
+                st = VS.get(p["oid"], k)
+                if st["parked"]:
+                    tpl = vsr.parked_template(tpl)
+                    if st["rear_view"] and math.cos(p["yaw"] - rm.heading_at(road_s[k], p["y"])) < 0:
+                        p = dict(p, yaw=p["yaw"] - math.pi)   # no motion cue; we saw its tail → same direction
+                    nstat["parked"] += 1
+                vsr.add_lamps(col, f"Obj_{i}", p, st, k, fps)
+                nstat["brake"] += st["brake"]
+                nstat["ind"] += st["indicator"] != "none"
             if p["asset"] == "StopSign.blend" and not tpl.get("textured"):
                 infra.texture_plate(tpl, assets / "StopSignImage.png", "StopSign")
                 tpl["textured"] = True
             mr.instance(tpl, f"Obj_{i}", p["x"], p["y"], p["yaw"], col, flip=p["asset"] in mr.ASSET_FLIP)
-        mr.setup_camera(scene, col, cinematic=True)
+        cam = mr.setup_camera(scene, col, cinematic=True)
+        if a.stills is not None:     # projected boxes → inset crops / debugging of vehicle_state placement
+            dump_boxes(scene, cam, placed, VS, k, out / f"frame_{k:05d}_objs.json")
         scene.render.filepath = str((out / f"frame_{k:05d}.png").resolve())
         bpy.ops.render.render(write_still=True)
         if n % 10 == 0:
             el = time.time() - t0
-            print(f"[seq] {n + 1}/{len(ks)} frame {k}  {el / (n + 1):.1f}s/frame  eta {el / (n + 1) * (len(ks) - n - 1) / 60:.0f} min",
+            print(f"[seq] {n + 1}/{len(rks)} frame {k}  {el / (n + 1):.1f}s/frame  eta {el / (n + 1) * (len(rks) - n - 1) / 60:.0f} min",
                   flush=True)
-    print(f"[seq] done {len(ks)} frames in {(time.time() - t0) / 60:.1f} min")
+    print(f"[seq] vstate instances: {dict(nstat)}")
+    print(f"[seq] done {len(rks)} frames in {(time.time() - t0) / 60:.1f} min")
 
 
 if __name__ == "__main__":
