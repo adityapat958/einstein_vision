@@ -290,3 +290,5 @@ print(min(k), max(k), d.get('fps', 30))")
 
 # vizjob rsync touches sequence_render.py → phase3 stills must be re-rendered (A3 mtime check) before composites
 job_stagec() { job_phase3 && job_composite "$@"; }
+# overnight chain: full-length front renders for all scenes, then phase3 refresh + composites
+job_night() { local rc=0; job_full "$@" || rc=1; job_stagec "$@" || rc=1; return $rc; }
