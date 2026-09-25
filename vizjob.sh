@@ -162,3 +162,73 @@ job_b1() {
   echo "B1 SUMMARY ok=[${ok[*]}] failed=[${bad[*]}]"
   [[ ${#bad[@]} -eq 0 ]]
 }
+
+# Wait until no other vizjob tmux session (besides ours) is running, so GPU timings/renders don't overlap.
+_wait_gpu_free() {
+  local me=${VJ_NAME:-$(tmux display-message -p '#S' 2>/dev/null)}
+  while tmux ls 2>/dev/null | cut -d: -f1 | grep '^vj-' | grep -v "^${me}\$" | grep -q .; do sleep 30; done
+}
+
+# Stage B2 timing: render N frames of a scene, report s/frame (no video).
+#   vizjob run speed -- 1 900 30 [samples] [extra args]
+job_speed() {
+  local scene=${1:-1} start=${2:-900} n=${3:-30} samples=${4:-32}; shift 4 2>/dev/null || shift $#
+  _wait_gpu_free
+  local out=renders/speedtest; rm -rf "$out"
+  local t0=$SECONDS
+  blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
+    --scene "$scene" --start "$start" --end $((start + n - 1)) --out "$out" --samples "$samples" --jpeg "$@" 2>&1 \
+    | grep --line-buffered -E "^\[seq\]|Error|Traceback"
+  local nf; nf=$(ls "$out"/frame_*.jpg 2>/dev/null | wc -l)
+  echo "SPEED scene$scene samples=$samples frames=$nf wall=$((SECONDS - t0))s"
+  [[ $nf -gt 0 ]] || return 1
+  vj-post image "$out/frame_$(printf %05d $((start + n / 2))).jpg" "speedtest s$scene f$((start + n / 2)) samples=$samples ($nf frames, $((SECONDS - t0))s wall)"
+}
+
+# Stage B2: full-length camera | render videos → renders/full/sceneN.mp4. Chunked Blender processes,
+# JPEG frames deleted after the mp4 is verified. Env: SAMPLES (32) STEP (1) CHUNK (600).
+#   vizjob run full -- 1 2 3 ... 13
+job_full() {
+  local scenes=("$@"); [[ ${#scenes[@]} -gt 0 ]] || scenes=($(seq 1 13))
+  local samples=${SAMPLES:-32} step=${STEP:-1} chunk=${CHUNK:-600} ok=() bad=()
+  _wait_gpu_free
+  mkdir -p renders/full
+  for s in "${scenes[@]}"; do
+    local free; free=$(df -BG --output=avail . | tail -1 | tr -dc 0-9)
+    if [[ $free -lt 5 ]]; then discord-notify --alert "ev-phase3: laptop disk ${free}G free, stopping job_full" 2>/dev/null; bad+=("s$s:disk"); break; fi
+    echo "######## full scene$s ########"; local t0=$SECONDS
+    local out=renders/full/work_s$s; rm -rf "$out"; mkdir -p "$out"
+    read first last fps < <(python3 -c "
+import json; d=json.load(open('phase2_output/scene$s/detections.json')); k=[f['frame_index'] for f in d['frames']]
+print(min(k), max(k), d.get('fps', 30))")
+    local st=$first fail=0
+    while [[ $st -le $last ]]; do
+      local en=$((st + chunk - 1)); [[ $en -gt $last ]] && en=$last
+      blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
+        --scene "$s" --start "$st" --end "$en" --out "$out" --samples "$samples" --step "$step" --jpeg 2>&1 \
+        | grep --line-buffered -E "^\[seq\] (done|[0-9]+/[0-9]+ frame [0-9]+ .*(eta)|vstate)|Error|Traceback"
+      [[ ${PIPESTATUS[0]} -eq 0 ]] || { fail=1; break; }
+      st=$((en + 1))
+    done
+    local nf; nf=$(ls "$out"/frame_*.jpg 2>/dev/null | wc -l)
+    [[ $fail -eq 0 && $nf -gt 0 ]] || { bad+=("s$s:render"); continue; }
+    local r0; r0=$(ls "$out"/frame_*.jpg | head -1 | grep -o '[0-9]\{5\}' | sed 's/^0*//'); r0=${r0:-0}
+    local v; v=$(ls P3Data/Sequences/scene$s/Undist/*-front_undistort.mp4 | head -1)
+    # render frames may be sparse (step / missing road frames): glob at fps/step then resample to fps
+    ffmpeg -loglevel error -y -i "$v" -framerate "$(python3 -c "print($fps/$step)")" -pattern_type glob -i "$out/frame_*.jpg" \
+      -filter_complex "[0:v]trim=start_frame=$r0,setpts=PTS-STARTPTS,scale=-2:720[c];[1:v]fps=$fps,scale=-2:720[r];[c][r]hstack=inputs=2:shortest=1,format=yuv420p" \
+      -r "$fps" -c:v libx264 -crf ${CRF:-27} -preset medium -movflags +faststart "renders/full/scene$s.mp4" \
+      || { bad+=("s$s:ffmpeg"); continue; }
+    local d sd; d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "renders/full/scene$s.mp4")
+    sd=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$v")
+    echo "scene$s: $nf frames rendered, video ${d}s vs source ${sd}s, $(( (SECONDS - t0) / 60 )) min"
+    if python3 -c "import sys; sys.exit(0 if $d >= 0.9*$sd else 1)"; then
+      ok+=("s$s")
+      local mid; mid=$(ls "$out"/frame_*.jpg | sed -n "$((nf / 2))p")
+      [[ " ${POST:-1 7 13} " == *" $s "* ]] && vj-post image "renders/full/scene$s.mp4" "full scene$s · camera | render · ${d}s"
+      rm -rf "$out"
+    else bad+=("s$s:short"); fi
+  done
+  echo "B2 SUMMARY ok=[${ok[*]}] failed=[${bad[*]}]"
+  [[ ${#bad[@]} -eq 0 ]]
+}

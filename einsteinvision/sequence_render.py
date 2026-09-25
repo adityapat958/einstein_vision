@@ -117,6 +117,8 @@ def main(argv):
     ap.add_argument("--analyze", action="store_true", help="print jitter by distance, no render")
     ap.add_argument("--stills", type=int, nargs="*", default=None,
                     help="lay out/smooth the whole range but render only these frames")
+    ap.add_argument("--step", type=int, default=1, help="render every Nth frame (video holds frames)")
+    ap.add_argument("--jpeg", action="store_true", help="write JPEG (q90) instead of PNG to save disk")
     ap.add_argument("--no-vstate", action="store_true", help="ignore road/sceneN/vehicle_state.json")
     a = ap.parse_args(argv)
     out = Path(a.out)
@@ -215,11 +217,16 @@ def main(argv):
     # ── 3. render ───────────────────────────────────────────────────────────
     scene = mr.reset_scene()
     scene.render.resolution_x, scene.render.resolution_y = a.res
-    scene.render.image_settings.file_format = "PNG"
+    ext = "jpg" if a.jpeg else "png"
+    scene.render.image_settings.file_format = "JPEG" if a.jpeg else "PNG"
+    if a.jpeg:
+        scene.render.image_settings.quality = 90
     col = scene.collection
     ego_tpl = None
     t0 = time.time()
     rks = [k for k in ks if a.stills is None or k in set(a.stills)]
+    if a.stills is None and a.step > 1:
+        rks = [k for k in rks if (k - a.start) % a.step == 0]
     nstat = Counter()
     for n, k in enumerate(rks):
         for ob in list(col.all_objects):
@@ -257,7 +264,7 @@ def main(argv):
         cam = mr.setup_camera(scene, col, cinematic=True)
         if a.stills is not None:     # projected boxes → inset crops / debugging of vehicle_state placement
             dump_boxes(scene, cam, placed, VS, k, out / f"frame_{k:05d}_objs.json")
-        scene.render.filepath = str((out / f"frame_{k:05d}.png").resolve())
+        scene.render.filepath = str((out / f"frame_{k:05d}.{ext}").resolve())
         bpy.ops.render.render(write_still=True)
         if n % 10 == 0:
             el = time.time() - t0
