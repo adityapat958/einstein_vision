@@ -145,3 +145,20 @@ PY
     vj-post image renders/phase3/check_s$s.png "phase3 check scene$s · camera | render (brake=red emissive, amber blink, parked desaturated)"
   done
 }
+
+# Stage B1: road + TL + vehicle_state for many scenes; continues past per-scene failures and
+# prints a summary table (fails overall if any scene failed, so logs get read).
+#   vizjob run b1 -- 2 4 5 6 7 8 9 10 11 12 13
+job_b1() {
+  local scenes=("$@"); [[ ${#scenes[@]} -gt 0 ]] || scenes=($(seq 1 13))
+  local ok=() bad=()
+  for s in "${scenes[@]}"; do
+    echo "######## scene$s road ########"; local t0=$SECONDS
+    if ! job_road "$s"; then bad+=("s$s:road"); continue; fi
+    echo "######## scene$s vstate ($((SECONDS - t0))s road) ########"
+    if ! job_vstate "$s"; then bad+=("s$s:vstate"); continue; fi
+    ok+=("s$s"); echo "######## scene$s done in $((SECONDS - t0))s ########"
+  done
+  echo "B1 SUMMARY ok=[${ok[*]}] failed=[${bad[*]}]"
+  [[ ${#bad[@]} -eq 0 ]]
+}
