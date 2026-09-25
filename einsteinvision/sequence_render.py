@@ -1,4 +1,4 @@
-"""EinsteinVision — temporally smoothed sequence renderer (style C, front chase view).
+"""EinsteinVision — temporally smoothed sequence renderer (style C; --view front|top|chase).
 
     blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
         --scene 1 --start 1900 --end 2140 --out renders/scene1_1900 [--samples 48 --res 1280 720]
@@ -103,6 +103,44 @@ def dump_boxes(scene, cam, placed, VS, k, path):
     Path(path).write_text(json.dumps(rows, indent=1))
 
 
+VIEWS = ("front", "top", "chase")
+
+
+def setup_view(scene, col, view):
+    """Camera for one view. front = the approved cinematic camera (mockup_render)."""
+    if view == "front":
+        return mr.setup_camera(scene, col, cinematic=True)
+    cam_d = bpy.data.cameras.new(f"Cam_{view}")
+    cam_d.clip_end = 800
+    cam = bpy.data.objects.new(f"Cam_{view}", cam_d)
+    col.objects.link(cam)
+    if view == "top":        # orthographic bird's-eye, ego near bottom, forward = image up
+        cam_d.type = "ORTHO"
+        cam_d.ortho_scale = 72.0
+        cam.location = (0.0, 14.5, 120.0)
+        cam.rotation_euler = (0.0, 0.0, 0.0)          # looks down −Z, image-up = +Y (forward)
+    else:                    # chase: well behind and above the ego car, ego fully in frame
+        cam_d.lens = 28
+        cam.location = (0.0, -17.0, 8.5)
+        mr.look_at(cam, (0.0, 14.0, 0.0))
+    scene.camera = cam
+    return cam
+
+
+def use_eevee(scene, samples):
+    for eng in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"):
+        try:
+            scene.render.engine = eng
+            break
+        except TypeError:
+            continue
+    ee = scene.eevee
+    ee.taa_render_samples = max(4, samples)
+    for attr, val in (("use_shadows", True), ("use_raytracing", False), ("use_gtao", True)):
+        if hasattr(ee, attr):
+            setattr(ee, attr, val)
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", type=int, required=True)
@@ -120,6 +158,11 @@ def main(argv):
     ap.add_argument("--step", type=int, default=1, help="render every Nth frame (video holds frames)")
     ap.add_argument("--jpeg", action="store_true", help="write JPEG (q90) instead of PNG to save disk")
     ap.add_argument("--no-vstate", action="store_true", help="ignore road/sceneN/vehicle_state.json")
+    ap.add_argument("--view", nargs="+", choices=VIEWS, default=["front"],
+                    help="camera(s): front (cinematic, default) | top (bird's-eye following ego) | chase "
+                         "(behind+above ego). Several views → out/<view>/frame_N from ONE scene build per frame")
+    ap.add_argument("--engine", choices=("cycles", "eevee"), default="cycles",
+                    help="eevee = cheap EEVEE Next pass (for top/chase composite cells)")
     a = ap.parse_args(argv)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -261,11 +304,16 @@ def main(argv):
                 infra.texture_plate(tpl, assets / "StopSignImage.png", "StopSign")
                 tpl["textured"] = True
             mr.instance(tpl, f"Obj_{i}", p["x"], p["y"], p["yaw"], col, flip=p["asset"] in mr.ASSET_FLIP)
-        cam = mr.setup_camera(scene, col, cinematic=True)
-        if a.stills is not None:     # projected boxes → inset crops / debugging of vehicle_state placement
-            dump_boxes(scene, cam, placed, VS, k, out / f"frame_{k:05d}_objs.json")
-        scene.render.filepath = str((out / f"frame_{k:05d}.{ext}").resolve())
-        bpy.ops.render.render(write_still=True)
+        if a.engine == "eevee":
+            use_eevee(scene, a.samples)
+        for view in a.view:
+            cam = setup_view(scene, col, view)
+            vdir = out if a.view == ["front"] else out / view
+            vdir.mkdir(parents=True, exist_ok=True)
+            if a.stills is not None and view == "front":   # projected boxes → inset crops / vstate debugging
+                dump_boxes(scene, cam, placed, VS, k, out / f"frame_{k:05d}_objs.json")
+            scene.render.filepath = str((vdir / f"frame_{k:05d}.{ext}").resolve())
+            bpy.ops.render.render(write_still=True)
         if n % 10 == 0:
             el = time.time() - t0
             print(f"[seq] {n + 1}/{len(rks)} frame {k}  {el / (n + 1):.1f}s/frame  eta {el / (n + 1) * (len(rks) - n - 1) / 60:.0f} min",

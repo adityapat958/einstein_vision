@@ -235,3 +235,58 @@ print(min(k), max(k), d.get('fps', 30))")
   echo "B2 SUMMARY ok=[${ok[*]}] failed=[${bad[*]}]"
   [[ ${#bad[@]} -eq 0 ]]
 }
+
+# Stage C: top + chase (EEVEE, one scene build per frame for both views) → 2×2 composite with renders/full/sceneN.mp4
+#   ┌ dashcam ┬ front ┐   1920×1080; the full mp4 is already camera|render synced, so cells 1–2 are crops of it
+#   └ top     ┴ chase ┘
+job_composite() {
+  local scenes=("$@"); [[ ${#scenes[@]} -gt 0 ]] || scenes=($(seq 1 13))
+  local samples=${SAMPLES:-16} step=${STEP:-2} chunk=${CHUNK:-600} ok=() bad=()
+  _wait_gpu_free
+  mkdir -p renders/composite
+  for s in "${scenes[@]}"; do
+    local free; free=$(df -BG --output=avail . | tail -1 | tr -dc 0-9)
+    if [[ $free -lt 5 ]]; then discord-notify --alert "ev-phase3: laptop disk ${free}G free, stopping job_composite" 2>/dev/null; bad+=("s$s:disk"); break; fi
+    [[ -f renders/full/scene$s.mp4 ]] || { bad+=("s$s:nofull"); continue; }
+    echo "######## composite scene$s ########"; local t0=$SECONDS
+    local out=renders/composite/work_s$s; rm -rf "$out"; mkdir -p "$out"
+    read first last fps < <(python3 -c "
+import json; d=json.load(open('phase2_output/scene$s/detections.json')); k=[f['frame_index'] for f in d['frames']]
+print(min(k), max(k), d.get('fps', 30))")
+    local st=$first fail=0
+    while [[ $st -le $last ]]; do
+      local en=$((st + chunk - 1)); [[ $en -gt $last ]] && en=$last
+      blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
+        --scene "$s" --start "$st" --end "$en" --out "$out" --samples "$samples" --step "$step" --jpeg \
+        --view top chase --engine eevee --res 960 540 2>&1 \
+        | grep --line-buffered -E "^\[seq\] (done|[0-9]+/[0-9]+ frame [0-9]+ .*(eta)|vstate)|Error|Traceback"
+      [[ ${PIPESTATUS[0]} -eq 0 ]] || { fail=1; break; }
+      st=$((en + 1))
+    done
+    local nf; nf=$(ls "$out"/top/frame_*.jpg 2>/dev/null | wc -l)
+    [[ $fail -eq 0 && $nf -gt 0 ]] || { bad+=("s$s:render"); continue; }
+    local r=$(python3 -c "print($fps/$step)")
+    ffmpeg -loglevel error -y -i "renders/full/scene$s.mp4" \
+      -framerate "$r" -pattern_type glob -i "$out/top/frame_*.jpg" \
+      -framerate "$r" -pattern_type glob -i "$out/chase/frame_*.jpg" \
+      -filter_complex "[0:v]split[a][b];[a]crop=iw/2:ih:0:0,scale=960:540,setsar=1[cam];[b]crop=iw/2:ih:iw/2:0,scale=960:540,setsar=1[fr];\
+[1:v]fps=$fps,scale=960:540,setsar=1[tp];[2:v]fps=$fps,scale=960:540,setsar=1[ch];\
+[cam][fr]hstack[u];[tp][ch]hstack[l];[u][l]vstack=shortest=1,format=yuv420p" \
+      -r "$fps" -c:v libx264 -crf ${CRF:-27} -preset medium -movflags +faststart "renders/composite/scene$s.mp4" \
+      || { bad+=("s$s:ffmpeg"); continue; }
+    local v; v=$(ls P3Data/Sequences/scene$s/Undist/*-front_undistort.mp4 | head -1)
+    local d sd; d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "renders/composite/scene$s.mp4")
+    sd=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$v")
+    echo "scene$s: $nf frames/view, composite ${d}s vs source ${sd}s, $(( (SECONDS - t0) / 60 )) min"
+    if python3 -c "import sys; sys.exit(0 if $d >= 0.9*$sd else 1)"; then
+      ok+=("s$s")
+      [[ " ${POST:-1 7 13} " == *" $s "* ]] && vj-post image "renders/composite/scene$s.mp4" "composite scene$s · dashcam | front / top | chase · ${d}s"
+      rm -rf "$out"
+    else bad+=("s$s:short"); fi
+  done
+  echo "C2 SUMMARY ok=[${ok[*]}] failed=[${bad[*]}]"
+  [[ ${#bad[@]} -eq 0 ]]
+}
+
+# vizjob rsync touches sequence_render.py → phase3 stills must be re-rendered (A3 mtime check) before composites
+job_stagec() { job_phase3 && job_composite "$@"; }
