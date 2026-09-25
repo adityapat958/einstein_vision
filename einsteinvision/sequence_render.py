@@ -40,13 +40,17 @@ def gauss_smooth(series: dict[int, dict], sigma: float, keys=("x", "y")):
         return {}
     out = {}
     lo, hi = fr[0], fr[-1]
-    ymed = sorted(series[f]["y"] for f in fr)[len(fr) // 2]
-    sg = sigma * min(max(ymed / 30.0, 1.0), 2.6)      # depth noise ∝ z² → wider window far away
-    W = int(3 * sg)
     for k in range(lo, hi + 1):
         near0 = [f for f in fr if abs(f - k) <= 6]
         if not near0 or min(abs(f - k) for f in near0) > 4:   # gap too long → hidden
             continue
+        # local (±30 f) stats, not whole-series: keeps results identical across render chunks
+        loc = [f for f in fr if abs(f - k) <= 30]
+        if len(loc) < 6:
+            continue
+        ymed = sorted(series[f]["y"] for f in loc)[len(loc) // 2]
+        sg = sigma * min(max(ymed / 30.0, 1.0), 2.6)  # depth noise ∝ z² → wider window far away
+        W = int(3 * sg)
         near = [f for f in fr if abs(f - k) <= W]
         ws = [math.exp(-0.5 * ((f - k) / sg) ** 2) for f in near]
         sw = sum(ws)
@@ -174,7 +178,11 @@ def main(argv):
     R = rm.load(f"road/scene{a.scene}/road_model.json")
     tlp = Path(f"road/scene{a.scene}/traffic_lights.json")
     TL = json.loads(tlp.read_text()) if tlp.exists() else {}
-    ks = [k for k in range(a.start, a.end + 1) if k in idx and k in R]
+    # layout + smoothing run over a padded window so road-mode (±20), track Gaussian (≤3σ≈27)
+    # and junction (±30 on smoothed tracks) windows are not truncated at chunk edges;
+    # only [start, end] is rendered → consecutive chunks agree at the seam
+    PAD = 60
+    ks = [k for k in range(a.start - PAD, a.end + PAD + 1) if k in idx and k in R]
     # Phase-3 semantics: parked/moving, brake lamps, indicators (vehicle_state.py sidecar)
     VS = vsr.VehicleState(f"road/scene{a.scene}/vehicle_state.json") if not a.no_vstate else vsr.VehicleState("")
     print(f"[seq] vehicle_state: {len(VS.tracks)} tracks" if VS else "[seq] vehicle_state: none")
@@ -285,7 +293,7 @@ def main(argv):
     col = scene.collection
     ego_tpl = None
     t0 = time.time()
-    rks = [k for k in ks if a.stills is None or k in set(a.stills)]
+    rks = [k for k in ks if a.start <= k <= a.end and (a.stills is None or k in set(a.stills))]
     if a.stills is None and a.step > 1:
         rks = [k for k in rks if (k - a.start) % a.step == 0]
     nstat = Counter()
