@@ -110,6 +110,7 @@ job_phase3() {
   local specs=("$@")
   [[ ${#specs[@]} -gt 0 ]] || specs=("1:486:87:right indicator (blink on phase)" "1:497:87:right indicator (blink off phase)" "1:990:377:braking" "1:655:337:parked"
                                     "3:60:2:stopped/parked" "3:1662:604:braking" "3:1830:860:braking" "3:2070:959:braking")
+  _wait_gpu_free
   mkdir -p renders/phase3/work
   declare -A pairs
   for sp in "${specs[@]}"; do
@@ -164,9 +165,11 @@ job_b1() {
 }
 
 # Wait until no other vizjob tmux session (besides ours) is running, so GPU timings/renders don't overlap.
-_wait_gpu_free() {
-  local me=${VJ_NAME:-$(tmux display-message -p '#S' 2>/dev/null)}
-  while tmux ls 2>/dev/null | cut -d: -f1 | grep '^vj-' | grep -v "^${me}\$" | grep -q .; do sleep 30; done
+_wait_gpu_free() {   # wait only for vj- sessions created before ours (FIFO, no deadlock)
+  local me; me=$(tmux display-message -p '#S' 2>/dev/null)
+  local mt; mt=$(tmux display-message -p '#{session_created}' 2>/dev/null); mt=${mt:-9999999999}
+  while tmux ls -F '#{session_name} #{session_created}' 2>/dev/null \
+        | awk -v me="$me" -v mt="$mt" '$1 ~ /^vj-/ && $1 != me && $2 < mt' | grep -q .; do sleep 30; done
 }
 
 # Stage B2 timing: render N frames of a scene, report s/frame (no video).
