@@ -88,3 +88,17 @@ job_video() {
   vj-post image "$out/scene${scene}_${start}_${end}.mp4" \
     "scene$scene frames $start-$end · camera | render (smoothed) · $(cat $out/jitter.json)"
 }
+
+# Phase-3 vehicle semantics (parked/moving, brake lights, indicators) → road/sceneN/vehicle_state.json
+# + labelled crop contact sheet road/sceneN/vehicle_state_check.png (posted).
+#   vizjob run vstate -- 1 3
+job_vstate() {
+  local scenes=("$@"); [[ ${#scenes[@]} -gt 0 ]] || scenes=(1 3)
+  for s in "${scenes[@]}"; do
+    [[ -f road/scene$s/road_model.json ]] || { echo "scene$s: no road_model.json (run road first)"; return 1; }
+    python3 einsteinvision/vehicle_state.py --scene "$s" 2>&1 | tee "road/scene$s/vehicle_state.log" || return 1
+    local summ; summ=$(grep -E "^\[vs\] scene$s: [0-9]+ tracks" "road/scene$s/vehicle_state.log" | sed 's/^\[vs\] //')
+    vj-post image "road/scene$s/vehicle_state_check.png" \
+      "scene$s vehicle_state check sheet (real crops, cyan=lamp ROIs, label=prediction) · $summ"
+  done
+}
