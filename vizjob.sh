@@ -70,15 +70,20 @@ job_video() {
   rm -rf "$out"; mkdir -p "$out"
   blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
     --scene "$scene" --start "$start" --end "$end" --out "$out" --samples "$samples" "$@" 2>&1 \
-    | grep --line-buffered -E "^\[seq\]|Error|Traceback|line [0-9]+" || return 1
+    | grep --line-buffered -E "^\[seq\]|Error|Traceback|line [0-9]+"
+  [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "blender failed"; return 1; }
+  grep -q "^" <(ls "$out"/frame_*.png 2>/dev/null) || return 1
+  local nf; nf=$(ls "$out"/frame_*.png | wc -l)
+  [[ $nf -ge $((end - start)) ]] || { echo "only $nf frames rendered"; return 1; }
+  export VH=${VH:-720}
   local fps; fps=$(python3 -c "import json;print(json.load(open('phase2_output/scene$scene/detections.json'))['fps'])")
   local v; v=$(ls P3Data/Sequences/scene$scene/Undist/*-front_undistort.mp4 | head -1)
   ffmpeg -loglevel error -y -i "$v" -vf "select=between(n\,$start\,$end),setpts=N/FRAME_RATE/TB,scale=960:720" \
     -vsync 0 "$out/cam_%05d.png" || return 1
   ffmpeg -loglevel error -y -framerate "$fps" -start_number 1 -i "$out/cam_%05d.png" \
     -framerate "$fps" -start_number "$start" -i "$out/frame_%05d.png" \
-    -filter_complex "[1:v]scale=1280:720[r];[0:v][r]hstack=inputs=2,format=yuv420p" \
-    -c:v libx264 -crf 27 -preset slow "$out/scene${scene}_${start}_${end}.mp4" || return 1
+    -filter_complex "[0:v]scale=-2:${VH:-720}[c];[1:v]scale=-2:${VH:-720}[r];[c][r]hstack=inputs=2,format=yuv420p" \
+    -c:v libx264 -crf ${CRF:-27} -preset slow -movflags +faststart "$out/scene${scene}_${start}_${end}.mp4" || return 1
   ls -la "$out"/*.mp4
   vj-post image "$out/scene${scene}_${start}_${end}.mp4" \
     "scene$scene frames $start-$end · camera | render (smoothed) · $(cat $out/jitter.json)"
