@@ -233,21 +233,44 @@ def dash_profile(mask, lines, b, c):
 
 
 def match_shift(prev, cur, max_ds=2.2):
-    """ds (m) maximising NCC of cur(z) vs prev(z + ds); returns (ds, score) or (None, score)."""
-    best, bs = None, -1.0
+    """ds (m) maximising NCC of cur(z) vs prev(z + ds); returns (ds, score) or (None, score).
+    Sub-bin parabola on the NCC curve (DZ = 0.1 m is 13 km/h per bin at 36 fps, so
+    integer bins alone quantise city speeds to 0 / 13 / 26 km/h)."""
     n = len(cur)
-    for k in range(0, int(max_ds / DZ) + 1):
+    K = int(max_ds / DZ) + 1
+    sc = np.full(K + 1, -1.0)
+    for k in range(0, K + 1):
         a = cur[: n - k]
         b_ = prev[k:]
-        if a.std() < 1e-3 or b_.std() < 1e-3:
+        if len(a) < 20 or a.std() < 1e-3 or b_.std() < 1e-3:
             continue
-        sc = float(np.corrcoef(a, b_)[0, 1])
-        if sc > bs:
-            best, bs = k, sc
-    if best is None or bs < 0.55:
+        sc[k] = float(np.corrcoef(a, b_)[0, 1])
+    best = int(np.argmax(sc))
+    bs = float(sc[best])
+    if bs < 0.55:
         return None, bs
-    # sub-pixel parabola
-    return float(best * DZ), bs
+    d = float(best)
+    if 0 < best < K and sc[best - 1] > -1 and sc[best + 1] > -1:
+        y0, y1, y2 = sc[best - 1], sc[best], sc[best + 1]
+        den = y0 - 2 * y1 + y2
+        if den < -1e-9:
+            d += float(np.clip(0.5 * (y0 - y2) / den, -0.5, 0.5))
+    return d * DZ, bs
+
+
+ODO_LAG = 4          # compare against the profile 4 frames back: 3.2 km/h per bin, ≤ 4.4 m shift
+
+
+def match_shift_lagged(hist, cur):
+    """Per-frame ds from the longest available lag (≤ ODO_LAG) whose match is confident."""
+    for lag in range(min(ODO_LAG, len(hist)), 0, -1):
+        p = hist[-lag]
+        if p is None:
+            continue
+        ds, sc = match_shift(p, cur, max_ds=1.1 * lag)
+        if ds is not None:
+            return ds / lag, sc
+    return None, 0.0
 
 
 def draw_debug(frame, bev, white, yellow, lines_fit, trk_state, b, c, out_png):
@@ -290,7 +313,7 @@ def main():
     cap.set(cv2.CAP_PROP_POS_FRAMES, a.start)
     trk = Tracker()
     frames_out = []
-    prev_prof = None
+    prof_hist = []          # last ODO_LAG dash profiles (None = no dashes)
     r0, r1 = int((Z_MAX - 30.0) / DZ), int((Z_MAX - 6.0) / DZ)      # z 6–30 m
     c0, c1 = int((-7.0 - X_MIN) / DX), int((7.0 - X_MIN) / DX)        # |x| < 7 m
     win = cv2.createHanningWindow((c1 - c0, r1 - r0), cv2.CV_32F)
@@ -320,9 +343,11 @@ def main():
         # marks move toward the camera → cur(z) ≈ prev(z + ds)
         prof = dash_profile(white | yellow, st, trk.b, trk.c)
         ds, dconf = None, 0.0
-        if prof is not None and prev_prof is not None:
-            ds, dconf = match_shift(prev_prof, prof)
-        prev_prof = prof
+        if prof is not None and prof_hist:
+            ds, dconf = match_shift_lagged(prof_hist, prof)
+        prof_hist.append(prof)
+        if len(prof_hist) > ODO_LAG:
+            prof_hist.pop(0)
         frames_out.append(dict(frame_index=fi, b=round(trk.b, 5), c=round(trk.c, 7), lines=st,
                                n_raw=len(dets), ds=None if ds is None else round(ds, 4),
                                ds_conf=round(float(dconf), 3)))

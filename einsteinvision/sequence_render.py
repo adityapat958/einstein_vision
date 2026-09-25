@@ -182,9 +182,18 @@ def main(argv):
     # ── 1. per-frame layout ──────────────────────────────────────────────────
     t0 = time.time()
     roads, raw_tracks, speeds = {}, defaultdict(dict), {}
+    # ego speed: fused vehicle_state ego (dash + BEV flow + divergence stop gate) when
+    # present — raw dash ds_s is bin-quantised / zero-locks in city scenes
+    vsp = Path(f"road/scene{a.scene}/vehicle_state.json")
+    ego_v = {}
+    if vsp.is_file() and not a.no_vstate:
+        ego_v = {int(k): float(v) for k, v in json.loads(vsp.read_text()).get("ego", {}).items()}
     for k in ks:
         rf = R[k]
-        speeds[k] = min(max(rf.get("ds_s", 0.7) * fps, 3.0), 45.0)
+        if k in ego_v:
+            speeds[k] = min(max(ego_v[k], 0.0), 45.0)
+        else:
+            speeds[k] = min(max(rf.get("ds_s", 0.7) * fps, 3.0), 45.0)
         mr.EGO_SPEED = speeds[k]
         mr.ROAD = roads[k] = rm.derive(rf)
         for p in mr.layout_objects(frames, idx[k], fps):
@@ -230,7 +239,16 @@ def main(argv):
     changes_sm = sum(1 for k0, k1 in zip(ks, ks[1:]) if road_signature(road_s[k0]) != road_signature(road_s[k1]))
     print(f"[seq] road structure changes: raw {changes_raw} → smoothed {changes_sm}")
 
-    S = {k: R[k].get("s", 0.0) for k in ks}
+    if ego_v:                                      # distance for dash scrolling / junction anchoring
+        S, acc = {}, 0.0
+        for k in range(0, max(ks) + 1):            # absolute from frame 0: chunk-consistent
+            acc += ego_v.get(k, 0.0) / fps
+            S[k] = acc
+        S = {k: S[k] for k in ks}
+        print(f"[seq] ego speed from vehicle_state: median {3.6 * sorted(speeds.values())[len(speeds) // 2]:.0f} km/h, "
+              f"{S[ks[-1]] - S[ks[0]]:.0f} m")
+    else:
+        S = {k: R[k].get("s", 0.0) for k in ks}
     Jw = {}
     for k in ks:
         mr.ROAD = road_s[k]
