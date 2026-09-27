@@ -3,6 +3,7 @@
     python3 mockup_compose.py single RENDER REF "label" OUT     # render + inset of real frame
     python3 mockup_compose.py pair   RENDER REF "label" OUT     # real frame | render, side by side
     python3 mockup_compose.py sheet  OUT IMG [IMG ...]          # 2-col grid, 1920 wide
+    python3 mockup_compose.py grid   OUT CAM FRONT TOP CHASE "label"   # 2x2 composite cell layout
 """
 import sys
 from pathlib import Path
@@ -100,6 +101,24 @@ def vstack(out, imgs, w=1920):
     s.save(out)
 
 
+def cam169(im, W, H):
+    """4:3 dashcam → 16:9 cell: crop sky/hood (keep a bit more sky than hood), then resize."""
+    ch = im.width * H // W
+    top = max(0, min(im.height - ch, int((im.height - ch) * 0.55)))
+    return im.crop((0, top, im.width, top + ch)).resize((W, H), Image.LANCZOS)
+
+
+def grid(out, cam, front, top, chase, text="", W=960, H=540):
+    cells = [cam169(Image.open(cam).convert("RGB"), W, H)] + \
+        [Image.open(p).convert("RGB").resize((W, H), Image.LANCZOS) for p in (front, top, chase)]
+    g = Image.new("RGB", (2 * W, 2 * H))
+    for i, c in enumerate(cells):
+        g.paste(c, ((i % 2) * W, (i // 2) * H))
+    if text:
+        label(g, text, 26)
+    g.save(out)
+
+
 if __name__ == "__main__":
     mode = sys.argv[1]
     if mode == "single":
@@ -110,6 +129,8 @@ if __name__ == "__main__":
         sheet(sys.argv[2], sys.argv[3:])
     elif mode == "inset":
         inset(*sys.argv[2:6])
+    elif mode == "grid":
+        grid(*sys.argv[2:8])
     elif mode == "vstack":
         vstack(sys.argv[2], sys.argv[3:])
     else:

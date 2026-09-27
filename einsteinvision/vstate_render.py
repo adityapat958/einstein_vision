@@ -17,6 +17,7 @@ from pathlib import Path
 import bpy
 
 BLINK_HZ = 1.5
+NIGHT = False        # set by the renderer: tail lamps glow, headlights on
 LAMP_H = {  # rear-lamp centre height (m) per asset
     "Vehicles/SedanAndHatchback.blend": 0.85,
     "Vehicles/SUV.blend": 1.00,
@@ -86,11 +87,13 @@ def lamp_meshes():
             "brake": _box_mesh("LampBrake", _emit_mat("BrakeOn", (1.0, 0.02, 0.01), 80.0)),
             "amber_off": _box_mesh("LampAmberOff", _emit_mat("AmberOff", (0.10, 0.05, 0.01), 0.0)),
             "amber_on": _box_mesh("LampAmberOn", _emit_mat("AmberOn", (1.0, 0.35, 0.0), 50.0)),
+            "tail_night": _box_mesh("LampTailNight", _emit_mat("TailNight", (1.0, 0.02, 0.01), 12.0)),
+            "head": _box_mesh("LampHead", _emit_mat("HeadOn", (1.0, 0.92, 0.8), 60.0)),
         }
     return _CACHE["lamps"]
 
 
-def _desat_material(m, sat=0.25, val=0.6):
+def _desat_material(m, sat=0.5, val=0.8):
     m2 = m.copy()
     m2.name = f"{m.name}_parked"
     m2.use_fake_user = True
@@ -158,14 +161,18 @@ def add_lamps(col, name, p, st, k, fps):
     ind = st["indicator"]
     specs = []
     for side in ((0,) if moto else (-1, 1)):
-        specs.append(("brake" if st["brake"] else "tail", side * red_off, h,
+        specs.append(("brake" if st["brake"] else ("tail_night" if NIGHT else "tail"), side * red_off, h,
                       (0.34 if not moto else 0.14, 0.06, 0.13)))
     for side, nm in ((-1, "left"), (1, "right")):
         lit = on and (ind == nm or ind == "hazard")
         specs.append(("amber_on" if lit else "amber_off", side * amb_off, h - 0.16, (0.30, 0.10, 0.12)))
-    for i, (kind, lat, z, sc) in enumerate(specs):
+    specs = [(kd, lat, z, sc, back) for kd, lat, z, sc in specs]
+    if NIGHT:                                          # headlights (front face)
+        for side in ((0,) if moto else (-1, 1)):
+            specs.append(("head", side * (0.0 if moto else W / 2 - 0.3), h - 0.2, (0.3, 0.06, 0.1), Ln / 2 + 0.05))
+    for i, (kind, lat, z, sc, bk) in enumerate(specs):
         ob = bpy.data.objects.new(f"{name}_lamp{i}", L[kind])
-        ob.location = (p["x"] + back * f[0] + lat * r[0], p["y"] + back * f[1] + lat * r[1], z)
+        ob.location = (p["x"] + bk * f[0] + lat * r[0], p["y"] + bk * f[1] + lat * r[1], z)
         ob.rotation_euler = (0, 0, yaw)
         ob.scale = sc
         col.objects.link(ob)

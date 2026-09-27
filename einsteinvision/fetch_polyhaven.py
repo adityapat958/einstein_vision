@@ -9,6 +9,8 @@ MODELS = ["street_lamp_01", "street_lamp_02", "concrete_road_barrier", "fire_hyd
           "metal_trash_can", "modular_electricity_poles", "utility_box_01", "water_manhole_cover",
           "shrub_01", "shrub_02", "shrub_04", "tree_small_02", "jacaranda_tree", "planter_box_01"]
 TEXTURES = ["asphalt_02", "clean_asphalt", "concrete_floor_02", "brick_crosswalk"]
+TEXTURES_2K = ["aerial_grass_rock"]                     # roadside ground (seen at grazing angles)
+HDRIS = ["kloofendal_48d_partly_cloudy_puresky", "kloofendal_overcast_puresky", "overcast_soil_puresky"]
 UA = {"User-Agent": "einstein-vision/1.0"}
 
 
@@ -52,6 +54,21 @@ def main():
             print(f"[ph] texture {tid} ok")
         except Exception as e:
             print(f"[ph] texture {tid} FAILED {e}")
+    for tid in TEXTURES_2K:
+        try:
+            f = get(f"https://api.polyhaven.com/files/{tid}")
+            for m in ("Diffuse", "nor_gl", "Rough"):
+                total += dl(f[m]["2k"]["jpg"]["url"], out / "textures" / tid / Path(f[m]["2k"]["jpg"]["url"]).name)
+            print(f"[ph] texture {tid} (2k) ok")
+        except Exception as e:
+            print(f"[ph] texture {tid} FAILED {e}")
+    for hid in HDRIS:                                   # sky-only HDRIs: our own ground plane stays visible
+        try:
+            u = get(f"https://api.polyhaven.com/files/{hid}")["hdri"]["2k"]["hdr"]["url"]
+            total += dl(u, out / "hdri" / f"{hid}.hdr")
+            print(f"[ph] hdri {hid} ok")
+        except Exception as e:
+            print(f"[ph] hdri {hid} FAILED {e}")
     (out / "LICENSE.txt").write_text("All assets from https://polyhaven.com — CC0 (public domain).\n")
     print(f"[ph] downloaded {total/1e6:.1f} MB into {out}")
 

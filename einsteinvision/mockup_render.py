@@ -33,6 +33,7 @@ from mathutils import Matrix, Vector
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import road_model as rm   # noqa: E402
 import infra              # noqa: E402
+import look               # noqa: E402
 
 JUNCTION = None      # intersection ahead (infra.find_junction) or None
 DASH_PHASE = 0.0     # ego distance travelled (m) → world-fixed dashes / barrier joints scroll
@@ -288,6 +289,11 @@ def layout_objects(frames: list, fi: int, fps: float, max_depth: float = 110.0, 
         x, z = _depth_xy(o, kept)
         if z > max_depth:
             continue
+        if cls == "person" and not KEEP_SIDEWALK_PEDS and ROAD is not None:
+            off = rm.offset_of(ROAD, x, z)             # keep only people on the road (crossing)
+            lo = min([l["a"] for l in ROAD["oncoming_lines"]], default=ROAD["left"])
+            if not (lo - 0.3 < off < ROAD["right"] + 0.3):
+                continue
         if asset.startswith("Vehicles/"):              # gentle snap, only if close
             if ROAD is not None:
                 off = rm.offset_of(ROAD, x, z)
@@ -401,11 +407,21 @@ def asset_template(assets_dir: Path, rel: str, override=None, fill=None):
     N = S @ T @ R
 
     col = bpy.data.collections.new(f"TPL_{Path(rel).stem}")
+    paint = PAINT.get(rel) if override is None and USE_PAINT else None
     for o in meshes:
         o.parent = None
-        o.matrix_world = N @ o.matrix_world
+        if rel in PAINT:              # bake into mesh data → Generated coords = Z-up car bbox (paint shader bands)
+            if o.data.users > 1:
+                o.data = o.data.copy()
+            o.data.transform(N @ o.matrix_world)
+            o.matrix_world = Matrix.Identity(4)
+        else:
+            o.matrix_world = N @ o.matrix_world
         col.objects.link(o)
-        if override is not None:
+        if paint is not None:
+            o.data.materials.clear()
+            o.data.materials.append(_paint(paint))
+        elif override is not None:
             o.data.materials.clear()
             o.data.materials.append(override)
         elif fill is not None and not any(o.data.materials):
@@ -416,9 +432,26 @@ def asset_template(assets_dir: Path, rel: str, override=None, fill=None):
     return col
 
 
-def instance(col_tpl, name, x, y, yaw, scene_col, flip=False):
-    """yaw: CCW heading from +Y (direction of travel). flip: model faces -Y."""
+USE_PAINT = True
+SCATTER_FURNITURE = False      # hydrants / bins / utility boxes along city kerbs
+KEEP_SIDEWALK_PEDS = False     # pedestrians outside the carriageway (sidewalk) are not drawn
+PAINT = {"Vehicles/SedanAndHatchback.blend": "car", "Vehicles/SUV.blend": "car",
+         "Vehicles/PickupTruck.blend": "car", "Vehicles/Truck.blend": "truck"}
+_PAINT_MATS = {}
+
+
+def _paint(kind):
+    if kind not in _PAINT_MATS or _PAINT_MATS[kind].name not in bpy.data.materials:
+        _PAINT_MATS[kind] = look.car_paint() if kind == "car" else look.box_truck_paint()
+    return _PAINT_MATS[kind]
+
+
+def instance(col_tpl, name, x, y, yaw, scene_col, flip=False, color=None):
+    """yaw: CCW heading from +Y (direction of travel). flip: model faces -Y.
+    color: linear RGB → object colour, read by the car-paint shader (Attribute INSTANCER 'color')."""
     e = bpy.data.objects.new(name, None)
+    if color is not None:
+        e.color = (*color[:3], 1.0)
     e.instance_type = "COLLECTION"
     e.instance_collection = col_tpl
     e.location = (x, y, 0.0)
@@ -705,8 +738,8 @@ def setup_camera(scene, col, cinematic=False):
     cam = bpy.data.objects.new("ChaseCam", cam_d)
     col.objects.link(cam)
     if cinematic:
-        cam.location = (0.6, -10.0, 3.4)
-        look_at(cam, (-0.8, 30.0, 0.6))
+        cam.location = (0.5, -12.5, 4.1)
+        look_at(cam, (-0.6, 38.0, 0.4))
         cam_d.dof.use_dof = True
         cam_d.dof.focus_distance = 25.0
         cam_d.dof.aperture_fstop = 5.6
@@ -871,8 +904,9 @@ def style_B(scene, col, assets, placed):
 def style_C(scene, col, assets, placed):
     """Cinematic — Cycles, sky, asphalt, original materials."""
     cycles_gpu(scene, 192)
-    color_mgmt(scene, "AgX - Medium High Contrast", 0.0)
-    world_sky(scene, 24, 200, 0.25)
+    exposure = look.lighting(scene, scene.collection)
+    color_mgmt(scene, "AgX - Medium High Contrast", exposure)
+    highway = look.ENV.get("kind") == "highway"
 
     # procedural asphalt
     road = bpy.data.materials.new("Asphalt")
@@ -911,27 +945,34 @@ def style_C(scene, col, assets, placed):
     concrete = mat_principled("Concrete", (0.45, 0.44, 0.42), rough=0.85)
     steel = mat_principled("Galvanised", (0.55, 0.56, 0.58), rough=0.35, metal=0.9)
     road = infra.pbr_material("AsphaltPBR", infra.EXTRA / "textures/asphalt_02", 0.25) or road
+    grass = look.grass_material() or grass
+    if look.ENV.get("wet"):
+        look.wet_road(road)
     walk = infra.pbr_material("SidewalkPBR", infra.EXTRA / "textures/concrete_floor_02", 0.4) or \
         mat_principled("Sidewalk", (0.5, 0.5, 0.48), rough=0.8)
     if ROAD is not None:
         build_road_curved(scene.collection, ROAD, road, grass, white, yellow)
         if JUNCTION is not None:
             infra.build_junction(scene.collection, ROAD, JUNCTION, road, white, yellow)
-        if ROAD["median"] != "barrier":
+        if ROAD["median"] != "barrier" and not highway:
             infra.build_sidewalks(scene.collection, ROAD, JUNCTION, walk, concrete)
-        infra.scatter_furniture(scene.collection, ROAD, JUNCTION)
+        if SCATTER_FURNITURE and not highway:          # off (user 2026-09-27: no bins / hydrants)
+            infra.scatter_furniture(scene.collection, ROAD, JUNCTION, phase=DASH_PHASE)
         if ROAD["median"] == "barrier":
             build_divider_curved(scene.collection, ROAD, concrete, ROAD["barrier_a"])
-        if ROAD["median"] == "barrier":
+        if ROAD["median"] == "barrier" or highway:
             build_guardrail_curved(scene.collection, ROAD, steel, ROAD["right"] + 1.0)
+        if highway and ROAD["median"] == "none":        # no median seen: close the left shoulder too
+            build_guardrail_curved(scene.collection, ROAD, steel, ROAD["left"] - 1.0)
+        if look.is_night():
+            look.street_lights(scene.collection, ROAD, DASH_PHASE)
     else:
         build_road(scene.collection, road, grass, white, yellow)
         build_divider(scene.collection, concrete, None, BARRIER_X)
         build_guardrail(scene.collection, steel, ROAD_RIGHT + 1.0)
     build_signals(scene.collection, SIGNALS, ROAD)
-    add_sun(scene.collection, 3.6, 1.2, rot=(58, 0, 215), color=(1.0, 0.90, 0.78))
     fill = mat_principled("CarPaint", (0.25, 0.27, 0.3), rough=0.25, metal=0.6, coat=1.0)
-    ego_m = mat_principled("Ego", (0.8, 0.02, 0.02), rough=0.2, metal=0.5, coat=1.0)
+    ego_m = look.car_paint("EgoPaint")
     return None, ego_m, {"__fill__": fill}
 
 
@@ -989,7 +1030,7 @@ def main(argv):
     # Ego vehicle (separate template so it can take its own material)
     ego_tpl = asset_template_copy(assets, "Vehicles/SedanAndHatchback.blend", ego_mat)
     instance(ego_tpl, "Ego", 0.0, 0.0, 0.0, col,
-             flip=("Vehicles/SedanAndHatchback.blend" in ASSET_FLIP) != a.flip_all)
+             flip=("Vehicles/SedanAndHatchback.blend" in ASSET_FLIP) != a.flip_all, color=look.EGO_COLOR)
 
     for i, p in enumerate(placed):
         ov = override
@@ -1000,7 +1041,7 @@ def main(argv):
             infra.texture_plate(tpl, assets / "StopSignImage.png", "StopSign")
             tpl["textured"] = True
         instance(tpl, f"Obj_{i}_{p['cls']}", p["x"], p["y"], p["yaw"], col,
-                 flip=(p["asset"] in ASSET_FLIP) != a.flip_all)
+                 flip=(p["asset"] in ASSET_FLIP) != a.flip_all, color=look.color_for(p["oid"]))
 
     setup_camera(scene, col, cinematic=(a.style == "C"))
     scene.render.filepath = str(Path(a.out).resolve())

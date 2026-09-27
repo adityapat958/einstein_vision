@@ -31,6 +31,7 @@ import mockup_render as mr   # noqa: E402
 import road_model as rm      # noqa: E402
 import infra                 # noqa: E402
 import vstate_render as vsr  # noqa: E402
+import look                  # noqa: E402
 
 
 def gauss_smooth(series: dict[int, dict], sigma: float, keys=("x", "y")):
@@ -81,6 +82,53 @@ def road_signature(r):
             tuple(l["color"][0] + l["style"][0] for l in r["lines"]))
 
 
+def widen_to_vehicles(road_s, per_frame, ks, win=45, max_add=(3, 2)):
+    """Lane model under-counts lanes (overpass shadow, worn paint): if tracked vehicles on OUR side
+    sit outside the carriageway, add lanes on that side. Need per frame = lanes to cover the
+    outermost car (centre ≥0.9 m inside), smoothed with a 60th-percentile over ±win frames so the
+    structure does not flicker with single noisy detections."""
+    need = {}
+    for k in ks:
+        r, L, R = road_s[k], 0, 0
+        for p in per_frame.get(k, []):
+            if not p["asset"].startswith("Vehicles/") or not (1.0 < p["y"] < 70.0):
+                continue
+            if rm.is_oncoming(r, p["x"], p["y"]):
+                continue
+            a = rm.offset_of(r, p["x"], p["y"])
+            if a < r["left"] + 0.9:
+                L = max(L, math.ceil((r["left"] + 0.9 - a) / r["W"] - 0.25))
+            if a > r["right"] - 0.9:
+                R = max(R, math.ceil((a - r["right"] + 0.9) / r["W"] - 0.25))
+        if r["median"] != "none":
+            L = 0                                  # yellow/barrier on the left is a real edge
+        need[k] = (min(L, max_add[0]), min(R, max_add[1]))
+    added = Counter()
+    for k in ks:
+        w = [need[j] for j in ks if abs(j - k) <= win]
+        nL = sorted(q[0] for q in w)[int(0.6 * (len(w) - 1))]
+        nR = sorted(q[1] for q in w)[int(0.6 * (len(w) - 1))]
+        if not (nL or nR):
+            continue
+        r = dict(road_s[k])
+        lines = [dict(l) for l in r["lines"]]
+        W = r["W"]
+        if nL:
+            lines[0].update(style="dashed", color="white")
+            for i in range(1, nL + 1):
+                lines.insert(0, dict(a=lines[0]["a"] - W, color="white",
+                                     style="solid" if i == nL else "dashed", double=False, synth=True))
+        if nR:
+            lines[-1].update(style="dashed")
+            for i in range(1, nR + 1):
+                lines.append(dict(a=lines[-1]["a"] + W, color="white",
+                                  style="solid" if i == nR else "dashed", double=False, synth=True))
+        r["lines"], r["left"], r["right"] = lines, lines[0]["a"], lines[-1]["a"]
+        road_s[k] = r
+        added[(nL, nR)] += 1
+    return added
+
+
 def dump_boxes(scene, cam, placed, VS, k, path):
     from bpy_extras.object_utils import world_to_camera_view
     from mathutils import Vector
@@ -108,6 +156,17 @@ def dump_boxes(scene, cam, placed, VS, k, path):
 
 
 VIEWS = ("front", "top", "chase")
+
+
+def ego_headlights(col):
+    for side in (-0.6, 0.6):
+        d = bpy.data.lights.new("EgoHead", "SPOT")
+        d.energy, d.color = 2500.0, (1.0, 0.95, 0.88)
+        d.spot_size, d.spot_blend, d.shadow_soft_size = math.radians(55), 0.5, 0.05
+        ob = bpy.data.objects.new("EgoHead", d)
+        ob.location = (side, 2.4, 0.7)
+        ob.rotation_euler = (math.radians(84), 0.0, 0.0)   # spot looks −Z; tilt to +Y, slightly down
+        col.objects.link(ob)
 
 
 def setup_view(scene, col, view):
@@ -168,6 +227,10 @@ def main(argv):
     ap.add_argument("--engine", choices=("cycles", "eevee"), default="cycles",
                     help="eevee = cheap EEVEE Next pass (for top/chase composite cells)")
     a = ap.parse_args(argv)
+    env = look.set_scene(a.scene)
+    vsr.NIGHT = look.is_night()
+    ncol = 0 if vsr.NIGHT else look.load_colors(f"road/scene{a.scene}/car_colors.json")   # sodium light → no colours
+    print(f"[seq] env {env}  car colours from camera: {ncol}")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     assets = Path(a.assets)
@@ -244,6 +307,8 @@ def main(argv):
             r["barrier_a"] = r["left"] - 0.9
         r["b"], r["c"] = roads[k]["b"], roads[k]["c"]
         road_s[k] = r if not a.raw else roads[k]
+    if not a.raw:
+        print(f"[seq] lanes added to cover vehicles (L,R)→frames: {dict(widen_to_vehicles(road_s, per_frame, ks))}")
     changes_sm = sum(1 for k0, k1 in zip(ks, ks[1:]) if road_signature(road_s[k0]) != road_signature(road_s[k1]))
     print(f"[seq] road structure changes: raw {changes_raw} → smoothed {changes_sm}")
 
@@ -313,7 +378,9 @@ def main(argv):
         if ego_tpl is None:
             ego_tpl = mr.asset_template_copy(assets, "Vehicles/SedanAndHatchback.blend", ego_mat)
         mr.instance(ego_tpl, "Ego", 0.0, 0.0, 0.0, col,
-                    flip="Vehicles/SedanAndHatchback.blend" in mr.ASSET_FLIP)
+                    flip="Vehicles/SedanAndHatchback.blend" in mr.ASSET_FLIP, color=look.EGO_COLOR)
+        if look.is_night():
+            ego_headlights(col)
         for i, p in enumerate(placed):
             tpl = mr.asset_template(assets, p["asset"], override=override, fill=fill)
             if VS and p["asset"].startswith("Vehicles/"):
@@ -329,7 +396,8 @@ def main(argv):
             if p["asset"] == "StopSign.blend" and not tpl.get("textured"):
                 infra.texture_plate(tpl, assets / "StopSignImage.png", "StopSign")
                 tpl["textured"] = True
-            mr.instance(tpl, f"Obj_{i}", p["x"], p["y"], p["yaw"], col, flip=p["asset"] in mr.ASSET_FLIP)
+            mr.instance(tpl, f"Obj_{i}", p["x"], p["y"], p["yaw"], col, flip=p["asset"] in mr.ASSET_FLIP,
+                        color=look.color_for(p["oid"], p["asset"]))
         if a.engine == "eevee":
             use_eevee(scene, a.samples)
         for view in a.view:

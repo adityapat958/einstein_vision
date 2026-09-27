@@ -2,6 +2,7 @@
 VJ_PROJECT=einstein_vision
 VJ_HOST=lablaptop-wg                                   # RTX 5060 + Blender 4.5
 VJ_DIR='~/Documents/Spring_26/CV/einstein_vision'      # data (P3Data, JSONs) lives there
+VJ_ENV="TAG POST SAMPLES STEP CHUNK CRF ENGINE KEEP FADE SECONDS_PER_CLIP"                # forwarded from caller env (vizjob run)
 
 # local → host: code only (P3Data / JSONs are already on the host)
 vj_sync() {
@@ -54,6 +55,32 @@ job_road() {
     python3 einsteinvision/tl_strip.py --scene "$s" --out road/scene$s/tl_strip.png && \
       vj-post image road/scene$s/tl_strip.png "scene$s traffic-light crops → classified state (please sanity-check red vs yellow)"
   done
+}
+
+# Look-dev stills: "scene:frame" → renders/look/<tag>/sheet.png, each frame a 2x2 cell
+# (dashcam | front / top | chase) exactly like the composite video. TAG env names the iteration.
+#   TAG=v1 vizjob run look -- 1:536 1:1286 3:1294 7:1231
+job_look() {
+  local specs=("$@"); [[ ${#specs[@]} -gt 0 ]] || specs=(1:536 1:1286 3:1294 7:1231)
+  local tag=${TAG:-latest} cells=()
+  _wait_gpu_free
+  local root=renders/look/$tag; rm -rf "$root"; mkdir -p "$root"
+  for sp in "${specs[@]}"; do
+    local s=${sp%%:*} f=${sp##*:}; local out=$root/s${s}_f${f}; mkdir -p "$out"
+    local st=$((f - 60)); [[ $st -lt 0 ]] && st=0
+    blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
+      --scene "$s" --start "$st" --end $((f + 60)) --stills "$f" --out "$out" --samples ${SAMPLES:-48} \
+      --view front top chase --engine ${ENGINE:-cycles} --res 1280 720 2>&1 | grep --line-buffered -E "^\[seq\] (done|vstate|layout|env|lanes)|Error|Traceback|line [0-9]+"
+    local fn=frame_$(printf %05d $f).png
+    [[ -f "$out/front/$fn" ]] || { echo "no render s$s f$f"; return 1; }
+    local ref; ref=$(_ref_frame "$s" "$f") || return 1
+    python3 einsteinvision/mockup_compose.py grid "$out/grid.png" "$ref" "$out/front/$fn" "$out/top/$fn" "$out/chase/$fn" \
+      "scene$s f$f · $tag" || return 1
+    cells+=("$out/grid.png")
+  done
+  python3 einsteinvision/mockup_compose.py vstack "$root/sheet.png" "${cells[@]}" || return 1
+  [[ ${POST:-1} == 1 ]] && vj-post image "$root/sheet.png" "look $tag · dashcam | front / top | chase"
+  return 0
 }
 
 # Mockups across scenes: "scene:frame" pairs, style C.
@@ -286,6 +313,94 @@ print(min(k), max(k), d.get('fps', 30))")
   done
   echo "C2 SUMMARY ok=[${ok[*]}] failed=[${bad[*]}]"
   [[ ${#bad[@]} -eq 0 ]]
+}
+
+# Final deliverable per scene, ONE scene build per frame for all three views:
+#   renders/final/sceneN_composite.mp4  (dashcam | front / top | chase, 1920x1080)
+#   renders/final/sceneN_front.mp4      (dashcam | front, 2560x720)
+#   ENGINE=eevee|cycles SAMPLES STEP CHUNK;  vizjob run final -- 1 3 7
+job_final() {
+  local scenes=("$@"); [[ ${#scenes[@]} -gt 0 ]] || scenes=($(seq 1 13))
+  local samples=${SAMPLES:-32} step=${STEP:-1} chunk=${CHUNK:-600} engine=${ENGINE:-cycles} ok=() bad=()
+  _wait_gpu_free
+  mkdir -p renders/final
+  for s in "${scenes[@]}"; do
+    local free; free=$(df -BG --output=avail . | tail -1 | tr -dc 0-9)
+    if [[ $free -lt 6 ]]; then vj-post text "laptop disk ${free}G free, stopping job_final"; bad+=("s$s:disk"); break; fi
+    echo "######## final scene$s ($engine, $samples spp, step $step) ########"; local t0=$SECONDS
+    local out=renders/final/work_s$s; rm -rf "$out"; mkdir -p "$out"
+    read first last fps < <(python3 -c "
+import json; d=json.load(open('phase2_output/scene$s/detections.json')); k=[f['frame_index'] for f in d['frames']]
+print(min(k), max(k), d.get('fps', 30))")
+    local st=$first fail=0
+    while [[ $st -le $last ]]; do
+      local en=$((st + chunk - 1)); [[ $en -gt $last ]] && en=$last
+      blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
+        --scene "$s" --start "$st" --end "$en" --out "$out" --samples "$samples" --step "$step" --jpeg \
+        --view front top chase --engine "$engine" --res 1280 720 2>&1 \
+        | grep --line-buffered -E "^\[seq\] (env|lanes|done|[0-9]+/[0-9]+ frame [0-9]+ .*(eta)|vstate)|Error|Traceback"
+      [[ ${PIPESTATUS[0]} -eq 0 ]] || { fail=1; break; }
+      st=$((en + 1))
+    done
+    local nf; nf=$(ls "$out"/front/frame_*.jpg 2>/dev/null | wc -l)
+    [[ $fail -eq 0 && $nf -gt 0 ]] || { bad+=("s$s:render"); continue; }
+    local r0; r0=$(ls "$out"/front/frame_*.jpg | head -1 | grep -o '[0-9]\{5\}' | sed 's/^0*//'); r0=${r0:-0}
+    local v; v=$(ls P3Data/Sequences/scene$s/Undist/*-front_undistort.mp4 | head -1)
+    local r; r=$(python3 -c "print($fps/$step)")
+    # dashcam 1280x960 → 16:9 crop (same as mockup_compose.cam169: 55 % of the spare height above)
+    ffmpeg -loglevel error -y -i "$v" \
+      -framerate "$r" -pattern_type glob -i "$out/front/frame_*.jpg" \
+      -framerate "$r" -pattern_type glob -i "$out/top/frame_*.jpg" \
+      -framerate "$r" -pattern_type glob -i "$out/chase/frame_*.jpg" \
+      -filter_complex "[0:v]trim=start_frame=$r0,setpts=PTS-STARTPTS,crop=1280:720:0:132,split[c1][c2];\
+[1:v]fps=$fps,split[f1][f2];[2:v]fps=$fps[tp];[3:v]fps=$fps[ch];\
+[c1]scale=960:540,setsar=1[cam];[f1]scale=960:540,setsar=1[fr];[tp]scale=960:540,setsar=1[t];[ch]scale=960:540,setsar=1[h];\
+[cam][fr]hstack[u];[t][h]hstack[l];[u][l]vstack=shortest=1,format=yuv420p[comp];\
+[c2]setsar=1[cf];[f2]setsar=1[ff];[cf][ff]hstack=shortest=1,format=yuv420p[pair]" \
+      -map "[comp]" -r "$fps" -c:v libx264 -crf ${CRF:-23} -preset medium -movflags +faststart "renders/final/scene${s}_composite.mp4" \
+      -map "[pair]" -r "$fps" -c:v libx264 -crf ${CRF:-23} -preset medium -movflags +faststart "renders/final/scene${s}_front.mp4" \
+      || { bad+=("s$s:ffmpeg"); continue; }
+    local d sd; d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "renders/final/scene${s}_composite.mp4")
+    sd=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$v")
+    echo "scene$s: $nf frames/view, ${d}s vs source ${sd}s, $(( (SECONDS - t0) / 60 )) min"
+    if python3 -c "import sys; sys.exit(0 if $d >= 0.9*$sd else 1)"; then
+      ok+=("s$s")
+      [[ " ${POST:-1 7 12} " == *" $s "* ]] && vj-post image "renders/final/scene${s}_composite.mp4" "final scene$s · dashcam | front / top | chase · ${d}s"
+      rm -rf "$out"
+    else bad+=("s$s:short"); fi
+  done
+  echo "FINAL SUMMARY ok=[${ok[*]}] failed=[${bad[*]}]"
+  [[ ${#bad[@]} -eq 0 ]]
+}
+
+# Portfolio demo reel: 5 s clips, front cinematic render 1920x1080 + dashcam inset, 0.5 s crossfades.
+#   vizjob run reel -- "1:840:Highway · day" "12:810:Night highway" ...     (scene:start:caption[:sub])
+#   SAMPLES (64) SECONDS (5) FADE (0.5); KEEP=1 re-uses already rendered clip frames
+job_reel() {
+  local secs=${SECONDS_PER_CLIP:-5} fade=${FADE:-0.5} samples=${SAMPLES:-64} args=()
+  _wait_gpu_free
+  local work=renders/reel/work; mkdir -p "$work"
+  for spec in "$@"; do
+    local s=${spec%%:*} rest=${spec#*:}; local st=${rest%%:*}
+    local fps; fps=$(python3 -c "import json;print(json.load(open('phase2_output/scene$s/detections.json')).get('fps',30))")
+    local en; en=$(python3 -c "print($st + round(($secs + $fade) * 36.0) - 1)")
+    local out=$work/s${s}_f${st}
+    if [[ ${KEEP:-0} == 1 && $(ls "$out"/frame_*.png 2>/dev/null | wc -l) -ge $((en - st + 1)) ]]; then
+      echo "reuse $out"
+    else
+      rm -rf "$out"; mkdir -p "$out"
+      echo "######## reel clip scene$s $st-$en ########"
+      blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
+        --scene "$s" --start "$st" --end "$en" --out "$out" --samples "$samples" --res 1920 1080 2>&1 \
+        | grep --line-buffered -E "^\[seq\] (env|lanes|done|[0-9]+/[0-9]+ frame [0-9]+ .*(eta))|Error|Traceback"
+      [[ ${PIPESTATUS[0]} -eq 0 ]] || return 1
+    fi
+    args+=(--clip "$spec")
+  done
+  python3 einsteinvision/reel.py --work "$work" --out renders/reel/einsteinvision_demo.mp4 \
+    --seconds "$secs" --fade "$fade" --fps 36 "${args[@]}" || return 1
+  vj-post image renders/reel/einsteinvision_demo.jpg "demo reel poster"
+  vj-post image renders/reel/einsteinvision_demo.mp4 "EinsteinVision demo reel"
 }
 
 # vizjob rsync touches sequence_render.py → phase3 stills must be re-rendered (A3 mtime check) before composites

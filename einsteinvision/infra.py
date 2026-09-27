@@ -336,7 +336,9 @@ def _inst(tpl, name, x, y, yaw, col, scale=1.0):
 SCATTER_GREENERY_AND_POLES = False     # user: no trees / poles / lamp posts
 
 
-def scatter_furniture(col, road, J, seed=7, y0=-10.0, y1=200.0):
+def scatter_furniture(col, road, J, seed=7, y0=-10.0, y1=200.0, phase=0.0):
+    """Street furniture. Hydrants / bins / boxes are WORLD-anchored: slot n sits at world distance
+    n·every (+ per-slot hash jitter) and scrolls past as the ego advances (phase = odometry, m)."""
     rnd = random.Random(seed)
     city = road["median"] != "barrier"
     left_a = min([l["a"] for l in road["oncoming_lines"]], default=road["left"])
@@ -383,9 +385,11 @@ def scatter_furniture(col, road, J, seed=7, y0=-10.0, y1=200.0):
             t = ph_template(name)
             if not t:
                 continue
-            y = y0 + rnd.uniform(5, every)
-            while y < y1:
-                if free(y):
+            for n in range(math.floor((y0 + phase) / every), math.ceil((y1 + phase) / every) + 1):
+                slot = random.Random(f"{seed}:{name}:{n}")
+                if slot.random() < 0.35:                       # not every slot is occupied
+                    continue
+                y = n * every + slot.uniform(0, 0.6 * every) - phase
+                if y0 <= y < y1 and free(y):
                     _inst(t, name, rm.x_at(road, right_a + 1.2, y), y, rm.heading_at(road, y), col)
-                y += every
     return placed
