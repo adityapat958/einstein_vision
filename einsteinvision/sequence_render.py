@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from collections import Counter, defaultdict
@@ -32,6 +33,13 @@ import road_model as rm      # noqa: E402
 import infra                 # noqa: E402
 import vstate_render as vsr  # noqa: E402
 import look                  # noqa: E402
+
+VERBOSE = os.environ.get("EV_VERBOSE") == "1"   # EV_VERBOSE=1 → per-stage [seq] diagnostics
+
+
+def dbg(*a, **k):
+    if VERBOSE:
+        print(*a, **k)
 
 
 def gauss_smooth(series: dict[int, dict], sigma: float, keys=("x", "y")):
@@ -230,7 +238,7 @@ def main(argv):
     env = look.set_scene(a.scene)
     vsr.NIGHT = look.is_night()
     ncol = 0 if vsr.NIGHT else look.load_colors(f"road/scene{a.scene}/car_colors.json")   # sodium light → no colours
-    print(f"[seq] env {env}  car colours from camera: {ncol}")
+    dbg(f"[seq] env {env}  car colours from camera: {ncol}")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     assets = Path(a.assets)
@@ -248,7 +256,7 @@ def main(argv):
     ks = [k for k in range(a.start - PAD, a.end + PAD + 1) if k in idx and k in R]
     # Phase-3 semantics: parked/moving, brake lamps, indicators (vehicle_state.py sidecar)
     VS = vsr.VehicleState(f"road/scene{a.scene}/vehicle_state.json") if not a.no_vstate else vsr.VehicleState("")
-    print(f"[seq] vehicle_state: {len(VS.tracks)} tracks" if VS else "[seq] vehicle_state: none")
+    dbg(f"[seq] vehicle_state: {len(VS.tracks)} tracks" if VS else "[seq] vehicle_state: none")
 
     # ── 1. per-frame layout ──────────────────────────────────────────────────
     t0 = time.time()
@@ -269,7 +277,7 @@ def main(argv):
         mr.ROAD = roads[k] = rm.derive(rf)
         for p in mr.layout_objects(frames, idx[k], fps):
             raw_tracks[p["oid"]][k] = p
-    print(f"[seq] layout {len(ks)} frames in {time.time() - t0:.0f}s, {len(raw_tracks)} tracks")
+    dbg(f"[seq] layout {len(ks)} frames in {time.time() - t0:.0f}s, {len(raw_tracks)} tracks")
 
     # ── 2. smoothing ────────────────────────────────────────────────────────
     if a.raw:
@@ -281,10 +289,10 @@ def main(argv):
         for lo, hi in ((0, 20), (20, 40), (40, 70), (70, 120)):
             band = lambda T: {o: {k: p for k, p in s_.items() if lo <= p["y"] < hi} for o, s_ in T.items()}
             n = sum(len(v) for v in band(raw_tracks).values())
-            print(f"[seq] y {lo:3d}-{hi:3d} m: n={n:4d}  raw {jitter_cm(band(raw_tracks)):6.1f}  "
+            dbg(f"[seq] y {lo:3d}-{hi:3d} m: n={n:4d}  raw {jitter_cm(band(raw_tracks)):6.1f}  "
                   f"smooth {jitter_cm(band(sm_tracks)):6.1f} cm/frame")
         return
-    print(f"[seq] object jitter (RMS 2nd diff): raw {jr:.1f} cm/frame → smoothed {js:.1f} cm/frame")
+    dbg(f"[seq] object jitter (RMS 2nd diff): raw {jr:.1f} cm/frame → smoothed {js:.1f} cm/frame")
     per_frame = defaultdict(list)
     for o, s in sm_tracks.items():
         for k, p in s.items():
@@ -308,9 +316,9 @@ def main(argv):
         r["b"], r["c"] = roads[k]["b"], roads[k]["c"]
         road_s[k] = r if not a.raw else roads[k]
     if not a.raw:
-        print(f"[seq] lanes added to cover vehicles (L,R)→frames: {dict(widen_to_vehicles(road_s, per_frame, ks))}")
+        dbg(f"[seq] lanes added to cover vehicles (L,R)→frames: {dict(widen_to_vehicles(road_s, per_frame, ks))}")
     changes_sm = sum(1 for k0, k1 in zip(ks, ks[1:]) if road_signature(road_s[k0]) != road_signature(road_s[k1]))
-    print(f"[seq] road structure changes: raw {changes_raw} → smoothed {changes_sm}")
+    dbg(f"[seq] road structure changes: raw {changes_raw} → smoothed {changes_sm}")
 
     if ego_v:                                      # distance for dash scrolling / junction anchoring
         S, acc = {}, 0.0
@@ -318,7 +326,7 @@ def main(argv):
             acc += ego_v.get(k, 0.0) / fps
             S[k] = acc
         S = {k: S[k] for k in ks}
-        print(f"[seq] ego speed from vehicle_state: median {3.6 * sorted(speeds.values())[len(speeds) // 2]:.0f} km/h, "
+        dbg(f"[seq] ego speed from vehicle_state: median {3.6 * sorted(speeds.values())[len(speeds) // 2]:.0f} km/h, "
               f"{S[ks[-1]] - S[ks[0]]:.0f} m")
     else:
         S = {k: R[k].get("s", 0.0) for k in ks}
@@ -410,10 +418,14 @@ def main(argv):
             bpy.ops.render.render(write_still=True)
         if n % 10 == 0:
             el = time.time() - t0
-            print(f"[seq] {n + 1}/{len(rks)} frame {k}  {el / (n + 1):.1f}s/frame  eta {el / (n + 1) * (len(rks) - n - 1) / 60:.0f} min",
+            print(f"[progress] {n + 1}/{len(rks)} frame {k}  {el / (n + 1):.1f}s/frame  eta {el / (n + 1) * (len(rks) - n - 1) / 60:.0f} min",
                   flush=True)
-    print(f"[seq] vstate instances: {dict(nstat)}")
-    print(f"[seq] done {len(rks)} frames in {(time.time() - t0) / 60:.1f} min")
+    dbg(f"[seq] vstate instances: {dict(nstat)}")
+    dbg(f"[seq] done {len(rks)} frames in {(time.time() - t0) / 60:.1f} min")
+    st = " · ".join(f"{k} {v}" for k, v in sorted(nstat.items()) if v)
+    wx = "/".join(x for x in ((env or {}).get("kind"), (env or {}).get("tod"), "wet" if (env or {}).get("wet") else "") if x)
+    print(f"[summary] scene{a.scene} f{a.start}-{a.end} · {len(rks)} frame{'s' * (len(rks) != 1)} in {(time.time() - t0) / 60:.1f} min"
+          f" · {wx} · {len(raw_tracks)} tracks" + (f" · {st}" if st else ""), flush=True)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 VJ_PROJECT=einstein_vision
 VJ_HOST=lablaptop-wg                                   # RTX 5060 + Blender 4.5
 VJ_DIR='~/Documents/Spring_26/CV/einstein_vision'      # data (P3Data, JSONs) lives there
-VJ_ENV="TAG POST SAMPLES STEP CHUNK CRF ENGINE KEEP FADE SECONDS_PER_CLIP"                # forwarded from caller env (vizjob run)
+VJ_ENV="TAG POST SAMPLES STEP CHUNK CRF ENGINE KEEP FADE SECONDS_PER_CLIP EV_VERBOSE"                # forwarded from caller env (vizjob run)
 
 # local → host: code only (P3Data / JSONs are already on the host)
 vj_sync() {
@@ -70,7 +70,7 @@ job_look() {
     local st=$((f - 60)); [[ $st -lt 0 ]] && st=0
     blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
       --scene "$s" --start "$st" --end $((f + 60)) --stills "$f" --out "$out" --samples ${SAMPLES:-48} \
-      --view front top chase --engine ${ENGINE:-cycles} --res 1280 720 2>&1 | grep --line-buffered -E "^\[seq\] (done|vstate|layout|env|lanes)|Error|Traceback|line [0-9]+"
+      --view front top chase --engine ${ENGINE:-cycles} --res 1280 720 2>&1 | grep --line-buffered -E "^\[(summary|progress)\]|Error|Traceback|line [0-9]+"
     local fn=frame_$(printf %05d $f).png
     [[ -f "$out/front/$fn" ]] || { echo "no render s$s f$f"; return 1; }
     local ref; ref=$(_ref_frame "$s" "$f") || return 1
@@ -97,7 +97,7 @@ job_video() {
   rm -rf "$out"; mkdir -p "$out"
   blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
     --scene "$scene" --start "$start" --end "$end" --out "$out" --samples "$samples" "$@" 2>&1 \
-    | grep --line-buffered -E "^\[seq\]|Error|Traceback|line [0-9]+"
+    | grep --line-buffered -E "^\[(summary|progress)\]|Error|Traceback|line [0-9]+"
   [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "blender failed"; return 1; }
   grep -q "^" <(ls "$out"/frame_*.png 2>/dev/null) || return 1
   local nf; nf=$(ls "$out"/frame_*.png | wc -l)
@@ -147,7 +147,7 @@ job_phase3() {
     rm -rf "$out"; mkdir -p "$out"
     blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
       --scene "$s" --start "$st" --end $((f + 45)) --stills "$f" --out "$out" --samples ${SAMPLES:-64} 2>&1 \
-      | grep --line-buffered -E "^\[seq\]|Error|Traceback|line [0-9]+"
+      | grep --line-buffered -E "^\[(summary|progress)\]|Error|Traceback|line [0-9]+"
     [[ -f "$out/frame_$(printf %05d $f).png" ]] || { echo "no render for s$s f$f"; return 1; }
     local ref; ref=$(_ref_frame "$s" "$f") || return 1
     local fr="$out/frame_$(printf %05d $f)"
@@ -208,7 +208,7 @@ job_speed() {
   local t0=$SECONDS
   blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
     --scene "$scene" --start "$start" --end $((start + n - 1)) --out "$out" --samples "$samples" --jpeg "$@" 2>&1 \
-    | grep --line-buffered -E "^\[seq\]|Error|Traceback"
+    | grep --line-buffered -E "^\[(summary|progress)\]|Error|Traceback"
   local nf; nf=$(ls "$out"/frame_*.jpg 2>/dev/null | wc -l)
   echo "SPEED scene$scene samples=$samples frames=$nf wall=$((SECONDS - t0))s"
   [[ $nf -gt 0 ]] || return 1
@@ -236,7 +236,7 @@ print(min(k), max(k), d.get('fps', 30))")
       local en=$((st + chunk - 1)); [[ $en -gt $last ]] && en=$last
       blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
         --scene "$s" --start "$st" --end "$en" --out "$out" --samples "$samples" --step "$step" --jpeg 2>&1 \
-        | grep --line-buffered -E "^\[seq\] (done|[0-9]+/[0-9]+ frame [0-9]+ .*(eta)|vstate)|Error|Traceback"
+        | grep --line-buffered -E "^\[(summary|progress)\]|Error|Traceback"
       [[ ${PIPESTATUS[0]} -eq 0 ]] || { fail=1; break; }
       st=$((en + 1))
     done
@@ -286,7 +286,7 @@ print(min(k), max(k), d.get('fps', 30))")
       blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
         --scene "$s" --start "$st" --end "$en" --out "$out" --samples "$samples" --step "$step" --jpeg \
         --view top chase --engine eevee --res 960 540 2>&1 \
-        | grep --line-buffered -E "^\[seq\] (done|[0-9]+/[0-9]+ frame [0-9]+ .*(eta)|vstate)|Error|Traceback"
+        | grep --line-buffered -E "^\[(summary|progress)\]|Error|Traceback"
       [[ ${PIPESTATUS[0]} -eq 0 ]] || { fail=1; break; }
       st=$((en + 1))
     done
@@ -338,7 +338,7 @@ print(min(k), max(k), d.get('fps', 30))")
       blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
         --scene "$s" --start "$st" --end "$en" --out "$out" --samples "$samples" --step "$step" --jpeg \
         --view front top chase --engine "$engine" --res 1280 720 2>&1 \
-        | grep --line-buffered -E "^\[seq\] (env|lanes|done|[0-9]+/[0-9]+ frame [0-9]+ .*(eta)|vstate)|Error|Traceback"
+        | grep --line-buffered -E "^\[(summary|progress)\]|Error|Traceback"
       [[ ${PIPESTATUS[0]} -eq 0 ]] || { fail=1; break; }
       st=$((en + 1))
     done
@@ -392,7 +392,7 @@ job_reel() {
       echo "######## reel clip scene$s $st-$en ########"
       blender -b --factory-startup --python einsteinvision/sequence_render.py -- \
         --scene "$s" --start "$st" --end "$en" --out "$out" --samples "$samples" --res 1920 1080 2>&1 \
-        | grep --line-buffered -E "^\[seq\] (env|lanes|done|[0-9]+/[0-9]+ frame [0-9]+ .*(eta))|Error|Traceback"
+        | grep --line-buffered -E "^\[(summary|progress)\]|Error|Traceback"
       [[ ${PIPESTATUS[0]} -eq 0 ]] || return 1
     fi
     args+=(--clip "$spec")
